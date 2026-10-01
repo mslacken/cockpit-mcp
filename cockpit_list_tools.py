@@ -467,12 +467,42 @@ class Control:
     def key(self) -> tuple[str, str, str]:
         return (self.kind, self.label or "", self.id or "")
 
-    def render(self) -> str:
+    def render(self, show_dialog: bool = True) -> str:
         out = f"{self.kind:<12} {'“' + self.label + '”' if self.label else '(no label)'}"
         if self.id:
             out += f"  #{self.id}"
-        if self.attrs:
-            out += "  " + " ".join(f"{k}={v}" for k, v in sorted(self.attrs.items()))
+        attrs = self.attrs if show_dialog else {k: v for k, v in self.attrs.items() if k != "dialog"}
+        if attrs:
+            out += "  " + " ".join(f"{k}={v}" for k, v in sorted(attrs.items()))
+        return out
+
+
+@dataclass
+class Subpage:
+    """A sub-view a page can switch to: a Cockpit dialog (e.g. a create-form
+    or confirm box) or a route (e.g. an account's details).
+
+    Cockpit pages are a single HTML file that hosts many such sub-views, so the
+    buttons a sub-view offers do not all live on the "primary" page — creating
+    a user and deleting one are separate sub-views. We recover them from the
+    per-dialog ``id`` / ``title`` / ``actions`` markers and the field ids they
+    own.
+    """
+    id: str                          # dialog id (e.g. "accounts-create-dialog")
+    title: str | None = None         # the dialog's title
+    actions: list[tuple[str, str]] = field(default_factory=list)  # (caption, style)
+    controls: list[Control] = field(default_factory=list)
+    fields: list[str] = field(default_factory=list)              # owned field ids
+
+    def render(self) -> str:
+        out = f'subpage "{self.id}"'
+        if self.title:
+            out += f'  — {self.title}'
+        if self.actions:
+            out += "  actions: " + ", ".join(c for c, _ in self.actions)
+        if self.fields:
+            ids = ", ".join(self.fields)
+            out += f"  fields: {ids[:60]}{'…' if len(ids) > 60 else ''}"
         return out
 
 
@@ -487,6 +517,7 @@ class Page:
     docs: list[str] = field(default_factory=list)
     scripts: list[str] = field(default_factory=list)   # bundles that were scanned
     controls: list[Control] = field(default_factory=list)
+    subpages: list[Subpage] = field(default_factory=list)
 
     def render(self) -> str:
         return f"[{self.section}] {self.label}  →  {self.path}"
@@ -884,6 +915,180 @@ def _classify(props: dict[str, str | None], component: str | None) -> str | None
 
 _FIELD_ID_RE = re.compile(r"\b(?:fieldId|htmlFor)\s*:")
 
+# ===========================================================================
+# Sub-page discovery: Cockpit dialogs and their owned fields
+# ===========================================================================
+#
+# A Cockpit page hosts many sub-views. "Dialog" is the canonical sub-view:
+# ``cockpitDialog({id:"…-dialog", title:"…", body:…}, {actions:[{caption,
+# style, clicked}], …})``. In a minified bundle the dialog's id/title still
+# survive (they are string literals), as do the ``caption`` / ``style`` of
+# each action. Cockpit pages also follow a strong naming convention that the
+# dialog's fields share the dialog's id minus the trailing "-dialog" (e.g.
+# dialog ``accounts-create-dialog`` owns ``accounts-create-real-name`` and
+# ``accounts-create-force-password-change``). That lets us attribute the flat
+# controls we already recover to a specific sub-page instead of lumping them
+# all under "the page".
+
+_DIALOG_ID_RE = re.compile(r'\bid\s*:\s*"([A-Za-z0-9_\-./]*dialog[A-Za-z0-9_\-./]*)",')
+_FIELD_ID_RE_2 = re.compile(r'\bid\s*:\s*"([A-Za-z0-9_\-./]+)"')
+_TITLE_LIT_RE = re.compile(r'\btitle\s*:\s*(?:[\w.]+\(\s*)?"([^"]+)"')
+_ACTION_CAPTION_RE = re.compile(r'\bcaption\s*:\s*(?:[\w.]+\()?\s*"([^"]+)"')
+_ACTION_STYLE_RE = re.compile(r'\bstyle\s*:\s*"?([A-Za-z]+)"?')
+
+
+@dataclass
+class _DialogDecl:
+    id: str
+    title: str | None = None
+    actions: list[tuple[str, str]] = field(default_factory=list)
+
+    @property
+    def prefix(self) -> str:
+        """The name a field id shares with this dialog: the id minus ``-dialog``."""
+        return (self.id[:-7] if self.id.endswith("-dialog")
+                else (self.id[:-6] if self.id.endswith("dialog") else self.id)) or self.id
+
+
+def _actions_arrays(js: JSSource) -> list[tuple[int, int]]:
+    """Balanced spans of every ``actions: [ … ]`` array in the bundle."""
+    out: list[tuple[int, int]] = []
+    for m in re.finditer(r"\bactions\s*:\s*\[", js.masked):
+        open_i = m.end() - 1
+        depth = 0
+        i = open_i
+        while i < len(js.masked):
+            c = js.masked[i]
+            if c == "[":
+                depth += 1
+            elif c == "]":
+                depth -= 1
+                if depth == 0:
+                    out.append((open_i, i))
+                    break
+            i += 1
+    return out
+
+
+def _parse_actions(js: JSSource, span: tuple[int, int] | None) -> list[tuple[str, str]]:
+    """(caption, style) pairs from inside one ``actions:[…]`` array."""
+    if span is None:
+        return []
+    lo, hi = span
+    text = js.text[lo:hi]
+    masked = js.masked[lo:hi]
+    actions: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    # split the array into its top-level {…} objects (depth over masked text)
+    objs: list[tuple[int, int]] = []
+    depth = 0
+    start = -1
+    for i, c in enumerate(masked):
+        if c == "{":
+            if depth == 0:
+                start = i
+            depth += 1
+        elif c == "}":
+            depth -= 1
+            if depth == 0 and start >= 0:
+                objs.append((start, i))
+                start = -1
+    for os_, oe in objs:
+        otext = text[os_:oe + 1]
+        capm = _ACTION_CAPTION_RE.search(otext)
+        if not capm:
+            continue
+        cap = capm.group(1)
+        if not cap or cap in seen:
+            continue
+        seen.add(cap)
+        stm = _ACTION_STYLE_RE.search(otext)
+        actions.append((cap, stm.group(1) if stm else ""))
+    return actions
+
+
+def _discover_dialogs(js: JSSource) -> dict[str, _DialogDecl]:
+    """Recover the dialogs a bundle declares: id, title, actions.
+
+    Each dialog's footer (``{actions:[…], …}``) is a separate literal that sits
+    just after its declaration and before the next dialog's, so in source order
+    a dialog *owns* the ``actions:[…]`` arrays that fall between its id and the
+    next id.
+    """
+    arrays = _actions_arrays(js)
+    positions: list[tuple[int, str, str | None]] = []
+    for m in _DIALOG_ID_RE.finditer(js.text):
+        span = js.enclosing_object(m.start())
+        lo = span[0] if span else max(0, m.start() - 200)
+        hi = span[1] if span else min(len(js.text), m.end() + 200)
+        title = None
+        tm = _TITLE_LIT_RE.search(js.text[lo:hi])
+        if tm:
+            title = tm.group(1)
+        positions.append((m.start(), m.group(1), title))
+    positions.sort()
+
+    decls: dict[str, _DialogDecl] = {}
+    for i, (pos, did, title) in enumerate(positions):
+        end = positions[i + 1][0] if i + 1 < len(positions) else len(js.text)
+        # arrays owned by this declaration: their opening bracket starts within
+        # (pos, end); take the first such array as this dialog's footer.
+        owned = [span for span in arrays if pos < span[0] < end]
+        actions = _parse_actions(js, owned[0] if owned else None)
+        decl = _DialogDecl(id=did, title=title, actions=actions)
+        old = decls.get(did)
+        if old is None or len(decl.actions) > len(old.actions):
+            decls[did] = decl
+    return decls
+
+
+def _owning_dialog(field_id: str, decls: dict[str, _DialogDecl]) -> str | None:
+    """Longest dialog whose prefix (id minus ``-dialog``) is a prefix of field_id."""
+    if not field_id or field_id.endswith("dialog"):
+        return None
+    best: tuple[int, str] = (-1, "")
+    for did, decl in decls.items():
+        p = decl.prefix
+        if p and (field_id == p or field_id.startswith(p + "-") or field_id.startswith(p + "_")):
+            if len(p) > best[0]:
+                best = (len(p), did)
+    return best[1] or None
+
+
+def _attribute(page_controls: list[Control],
+              field_ids: list[str],
+              decls: dict[str, _DialogDecl]
+              ) -> tuple[list[Control], list[Subpage]]:
+    """Split the flat control/field set into page controls and per-dialog sub-pages."""
+    subs: dict[str, Subpage] = {did: Subpage(id=did, title=d.title, actions=list(d.actions))
+                                for did, d in decls.items()}
+    for cid in field_ids:
+        owner = _owning_dialog(cid, decls)
+        if owner and owner in subs:
+            if cid not in subs[owner].fields:
+                subs[owner].fields.append(cid)
+    attributed: set[tuple[str, str, str]] = set()
+    for control in page_controls:
+        owner = _owning_dialog(control.id or "", decls) if control.id else None
+        if owner and owner in subs:
+            control.attrs["dialog"] = owner
+            subs[owner].controls.append(control)
+            attributed.add(control.key())
+    # synthesise action buttons that were not picked up as plain controls
+    for sub in subs.values():
+        existing = {(c.label or "", c.id or "") for c in sub.controls}
+        for caption, style in sub.actions:
+            if (caption, "") in existing:
+                continue
+            sub.controls.append(Control(
+                kind="button",
+                label=caption,
+                attrs={k: v for k, v in {"style": style, "dialog": sub.id}.items() if v},
+            ))
+    # page controls = those not attributed to any dialog
+    left = [ctrl for ctrl in page_controls if ctrl.key() not in attributed]
+    return left, sorted(subs.values(), key=lambda s: s.id)
+
 
 def _field_labels(js: JSSource) -> dict[str, str]:
     """id → label, from the <FormGroup label=… fieldId=…> wrappers.
@@ -903,11 +1108,18 @@ def _field_labels(js: JSSource) -> dict[str, str]:
     return labels
 
 
-def scan_js(text: str, source: str) -> list[Control]:
-    """Recover the controls a bundle renders. See the module docstring."""
+def scan_js(text: str, source: str) -> tuple[list[Control], list[Subpage]]:
+    """Recover the controls a bundle renders, and the subpages it embeds.
+
+    See the module docstring for the flat-control pass; the sub-page pass walks
+    every ``{id:"…-dialog", …}`` object in the bundle and attributes the flat
+    controls to the dialog whose prefix matches (e.g. ``accounts-create-*``
+    fields belong to ``accounts-create-dialog``).
+    """
     js = JSSource(text)
     field_labels = _field_labels(js)
     found: dict[tuple[str, str, str], Control] = {}
+    field_ids: list[str] = []
 
     for anchor in _ANCHOR_RE.finditer(js.masked):
         span = js.enclosing_object(anchor.start())
@@ -940,8 +1152,22 @@ def scan_js(text: str, source: str) -> list[Control]:
             source=source,
         )
         found.setdefault(control.key(), control)
+        if control.id and control.id not in field_ids:
+            field_ids.append(control.id)
 
-    return sorted(found.values(), key=Control.key)
+    # pick up fieldIds / htmlFor / id attributes that never triggered an anchor
+    # (form-group captions etc.) so the ownership pass can see them.
+    for field_id in field_labels:
+        if field_id not in field_ids:
+            field_ids.append(field_id)
+    for m in _FIELD_ID_RE_2.finditer(js.text):
+        iid = m.group(1)
+        if iid not in field_ids:
+            field_ids.append(iid)
+
+    page_controls = sorted(found.values(), key=Control.key)
+    decls = _discover_dialogs(js)
+    return _attribute(page_controls, field_ids, decls)
 
 
 # ==========================================================================
@@ -953,7 +1179,7 @@ SKIP_SCRIPT_RE = re.compile(r"(^|/)(po(\.manifest)?(\.[\w-]+)?\.js|manifests\.js
 
 
 def introspect_page(pkg: str, page: Page, assets: AssetFetcher) -> None:
-    """Fill in page.controls / page.scripts from the page's HTML and bundles."""
+    """Fill in page.controls / page.scripts / page.subpages from the HTML + bundles."""
     relative = page.path.split("#", 1)[0].split("?", 1)[0]
     if not relative or relative.startswith(("http:", "https:", "//")):
         return
@@ -964,7 +1190,8 @@ def introspect_page(pkg: str, page: Page, assets: AssetFetcher) -> None:
         return
     parser = PageParser(source=relative)
     parser.feed(body)
-    controls = list(parser.controls)
+    controls: list[Control] = list(parser.controls)
+    subpages: list[Subpage] = []
 
     for src in parser.scripts:
         if src.startswith(("http:", "https:", "//")) or not src.endswith(".js"):
@@ -976,7 +1203,9 @@ def introspect_page(pkg: str, page: Page, assets: AssetFetcher) -> None:
         if script is None:
             continue
         page.scripts.append(posixpath.basename(url))
-        controls += scan_js(script, posixpath.basename(url))
+        page_controls, script_subpages = scan_js(script, posixpath.basename(url))
+        controls += page_controls
+        subpages += script_subpages
 
     seen: set[tuple[str, str, str]] = set()
     for control in controls:
@@ -984,6 +1213,27 @@ def introspect_page(pkg: str, page: Page, assets: AssetFetcher) -> None:
             seen.add(control.key())
             page.controls.append(control)
     page.controls.sort(key=Control.key)
+
+    # Merge subpages by id (same dialog may be declared across several bundles).
+    by_id: dict[str, Subpage] = {}
+    for sub in subpages:
+        existing = by_id.get(sub.id)
+        if existing is None:
+            by_id[sub.id] = sub
+            continue
+        if sub.title and not existing.title:
+            existing.title = sub.title
+        for pair in sub.actions:
+            if pair not in existing.actions:
+                existing.actions.append(pair)
+        have = {c.key() for c in existing.controls}
+        for c in sub.controls:
+            if c.key() not in have:
+                existing.controls.append(c)
+        for f in sub.fields:
+            if f not in existing.fields:
+                existing.fields.append(f)
+    page.subpages = sorted(by_id.values(), key=lambda s: s.id)
 
 
 def introspect(packages: list[Package], cookie: str) -> None:
@@ -1056,6 +1306,14 @@ def build_tree(packages: list[Package], title: str) -> Node:
                     knode = node.add(label)
                     for control in page.controls:
                         knode.add(control.render())
+                if page.subpages:
+                    snode = node.add(f"subpages ({len(page.subpages)})")
+                    for sub in page.subpages:
+                        subnode = snode.add(sub.render())
+                        if sub.fields:
+                            subnode.add("fields: " + ", ".join(sub.fields))
+                        for control in sub.controls:
+                            subnode.add(control.render(show_dialog=False))
         if not pkg.pages and not pkg.commands:
             pnode.add("(no menu/tools/dashboard/commands entries)")
     return root
