@@ -50,6 +50,13 @@ string props, and take the label from label/aria-label/title or from the first
 string literal among the element's children — which is where a gettext call
 like _("Change profile") puts it.
 
+Beyond the label, each control gets a best-effort *purpose hint*: the action
+verb its id encodes ("network-interface-delete" → delete), combined with the
+first plausible gettext string in the few hundred characters after the element
+(confirmation captions, aria-labels, dialog titles). It is "the neighbourhood
+says it does X", not the handler's actual semantics — the handler itself is
+minified away.
+
 This is a heuristic, not a parser: it can miss a control whose handler is
 spread in from a variable, and it can report one that is only rendered
 conditionally. It is accurate enough to answer "what can I do on this page".
@@ -463,6 +470,7 @@ class Control:
     id: str | None = None
     attrs: dict[str, str] = field(default_factory=dict)
     source: str = ""                # the file it was recovered from
+    hint: str | None = None         # best-effort "what this roughly does" (see module docstring)
 
     def key(self) -> tuple[str, str, str]:
         return (self.kind, self.label or "", self.id or "")
@@ -474,6 +482,8 @@ class Control:
         attrs = self.attrs if show_dialog else {k: v for k, v in self.attrs.items() if k != "dialog"}
         if attrs:
             out += "  " + " ".join(f"{k}={v}" for k, v in sorted(attrs.items()))
+        if self.hint:
+            out += f"  → {self.hint}"
         return out
 
 
@@ -883,6 +893,80 @@ LABEL_PROPS = ("label", "aria-label", "title", "text", "content", "placeholder",
 # found after it belongs to whatever is rendered next.
 LABEL_FROM_CHILDREN = ("button", "menu-item", "option", "tab", "toggle", "link")
 
+# Action verbs Cockpit ids are named after ("…-delete", "…new-…-toggle"). A
+# small whitelist rather than an arbitrary word list, so an id mentioning an
+# action verb is a signal, but one that happens to mention a data noun isn't.
+ACTION_VERBS = (
+    "delete", "remove", "create", "new", "add", "save", "apply", "submit",
+    "enable", "disable", "start", "stop", "restart", "reload", "reconfigure",
+    "edit", "change", "modify", "update", "open", "close", "show", "hide",
+    "clear", "cancel", "confirm", "revert", "reset", "toggle", "on", "off",
+    "connect", "disconnect", "import", "export", "attach", "detach",
+    "upgrade", "install", "refresh", "retry", "reboot", "shutdown",
+)
+
+# Kinds a purpose hint is meaningful for.
+HINT_KINDS = frozenset(("button", "select", "checkbox", "switch", "menu-item",
+                        "option", "toggle", "radio"))
+
+# Prop-style words that pass _is_label() but are not user-visible captions,
+# so a weak hint never becomes "variant=primary".
+_JUNK_WORDS = frozenset(w.lower() for w in (
+    "primary", "secondary", "danger", "success", "warning", "link", "plain",
+    "true", "false", "null", "auto", "center", "left", "right", "top", "bottom",
+    "default", "static", "dynamic", "fixed", "inline", "block"))
+
+# How close a string has to be to the control to be considered its caption:
+# near enough that a dialog title or action caption is usually reached, but a
+# sentence on the next page almost never is.
+HINT_WINDOW = 600
+
+
+def _is_candidate(value: str) -> bool:
+    return _is_label(value) and value.strip().lower() not in _JUNK_WORDS
+
+
+def _id_verb(control_id: str | None) -> str | None:
+    """The last token of a control id, if it is one of the action verbs above."""
+    if not control_id:
+        return None
+    verb = re.split(r"[-_\s]+", control_id.lower())[-1]
+    return verb if verb in ACTION_VERBS else None
+
+
+def _purpose_hint(js: JSSource, end: int, label: str | None, control_id: str | None) -> str | None:
+    """Best-effort "what this roughly does", from id + the closest nearby strings.
+
+    Two independent signals, either alone is enough:
+      * the control's id naming an action verb (…-delete, …-restart) — strong;
+      * the closest plausible gettext string after the element (a caption, an
+        aria-label, a nearby dialog title) — weak on its own.
+
+    A "strong" phrase is one the verb itself appears in ("Delete bond0" for a
+    delete button) and outranks "weak" phrases like a bare "Cancel". Without a
+    verb there is only the weakest evidence, and a bare technical word
+    ("primary") is dropped rather than guessed. A string that *is* the label
+    adds no information and is skipped.
+    """
+    verb = _id_verb(control_id)
+    lab = (label or "").strip().lower()
+    strong = weak = None
+    for pos, _end, value in js.strings[bisect.bisect_left(js._starts, end):]:
+        if pos >= end + HINT_WINDOW:
+            break
+        candidate = value.strip()
+        if not _is_candidate(candidate) or candidate.lower() == lab:
+            continue
+        if verb and verb in candidate.lower():
+            strong = candidate
+            break
+        weak = weak or candidate
+    if strong:
+        return strong
+    if verb:
+        return f"a {verb} action"
+    return weak
+
 
 def _classify(props: dict[str, str | None], component: str | None) -> str | None:
     """Name the kind of control an element with these props is, or None."""
@@ -1144,12 +1228,14 @@ def scan_js(text: str, source: str) -> tuple[list[Control], list[Subpage]]:
             # children of createElement(C, {…}, HERE) — where a label literal lives
             label = js.child_string(end, min(len(js.text), end + 400))
 
+        cid = props.get("id")
         control = Control(
             kind=kind,
             label=label,
-            id=props.get("id"),
+            id=cid,
             attrs={k: props[k] for k in ("variant", "type", "name") if props.get(k)},  # type: ignore[misc]
             source=source,
+            hint=_purpose_hint(js, end, label, cid) if kind in HINT_KINDS else None,
         )
         found.setdefault(control.key(), control)
         if control.id and control.id not in field_ids:
