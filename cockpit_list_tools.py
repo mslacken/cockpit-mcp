@@ -116,6 +116,14 @@ with a verb — or it is dropped as scenery. Input types come from the control
 (checkbox → boolean, NumberInput → integer, everything else a string), and a
 select whose options were recovered carries them as a JSON Schema enum.
 
+--tools prints that list as a *tree* — package → page → tool — with each tool
+on one line as its call signature, ``name(arg, required_arg*)``, and its title,
+dialog, inputs and selectors folded underneath. That is the shape to review a
+whole catalog in; --tools --flat prints each tool in full instead, and
+--tools --json emits the MCP definitions. They are *mock* tools throughout:
+definitions recovered from the UI, with the coordinates a driver would need.
+Nothing in this script invokes anything.
+
 Each tool also carries the selectors a caller needs to drive it — the dialog,
 the button that opens it, the one that confirms it, the one that abandons it,
 and one per input. They are the same selectors Cockpit's own browser tests use
@@ -140,7 +148,8 @@ USAGE
     COCKPIT_PASSWORD=… ./cockpit_list_tools.py --package systemd
     COCKPIT_PASSWORD=… ./cockpit_list_tools.py --json          # machine readable (for MCP)
     COCKPIT_PASSWORD=… ./cockpit_list_tools.py --no-controls   # manifest only, fast
-    COCKPIT_PASSWORD=… ./cockpit_list_tools.py --tools         # the actions, as tools
+    COCKPIT_PASSWORD=… ./cockpit_list_tools.py --tools         # tree of mock tools
+    COCKPIT_PASSWORD=… ./cockpit_list_tools.py --tools --flat  # one tool at a time, in full
     COCKPIT_PASSWORD=… ./cockpit_list_tools.py --tools --json  # MCP tool definitions
 
     COCKPIT_CA=/path/ca.pem ./cockpit_list_tools.py https://myhost   # pin a CA
@@ -2730,6 +2739,91 @@ def tools_to_json(tools: list[Tool]) -> str:
     return json.dumps([t.to_json() for t in tools], indent=2)
 
 
+# --------------------------------------------------------------------------
+# The same tools as a tree
+# --------------------------------------------------------------------------
+#
+# render_tools() above prints every tool in full, which is the right shape for
+# reading one tool but a poor one for reviewing 150. The tree puts each tool on
+# a single line — its call signature — under the page it came from, with the
+# detail folded underneath, so the whole catalog can be scanned at once.
+#
+# They are *mock* tools: definitions recovered from the UI, with the selectors
+# a driver would need. Nothing here is wired up to the host.
+
+def _tool_signature(tool: Tool) -> str:
+    """``name(arg, required_arg*)`` — a tool's call shape on one line."""
+    if not tool.params:
+        return f"{tool.name}()"
+    return f"{tool.name}(" + ", ".join(
+        p.name + ("*" if p.required else "") for p in tool.params) + ")"
+
+
+def _clip(text: str, width: int = 96) -> str:
+    """Collapse whitespace and cut to ``width`` — tree lines do not wrap."""
+    text = " ".join(text.split())
+    return text if len(text) <= width else text[:width - 1].rstrip() + "…"
+
+
+def _tool_node(tool: Tool) -> Node:
+    """One tool as a subtree: signature, what it does, its inputs, how to drive it."""
+    head = _tool_signature(tool)
+    if tool.destructive:
+        head += "   [destructive]"
+    node = Node(head)
+    node.add(_clip(tool.title))
+
+    if tool.dialog:
+        via = f"dialog “{tool.dialog}”"
+        if tool.action:
+            via += f" · action “{tool.action}”"
+        if tool.opens_via:
+            via += f" · opened from “{tool.opens_via}”"
+        if tool.framework:
+            via += f"   [{tool.framework}]"
+        node.add(via)
+    elif tool.control_id:
+        node.add(f"page control #{tool.control_id}")
+
+    if tool.params:
+        inode = node.add(f"inputs ({len(tool.params)})")
+        width = max(len(p.name) for p in tool.params)
+        for param in tool.params:
+            inode.add(param.render(width))
+    else:
+        node.add("inputs: (none)")
+
+    if tool.selectors:
+        node.add("drive: " + "  ".join(f"{k}={v}" for k, v in sorted(tool.selectors.items())))
+    return node
+
+
+def build_tools_tree(tools: list[Tool], title: str) -> Node:
+    """The tool catalog as a tree: package → page → tool → inputs.
+
+    Tools arrive grouped by package already (build_tools walks the packages in
+    order), so plain insertion-ordered dicts keep the listing stable.
+    """
+    root = Node(f"{title} — mock tool catalog: {len(tools)} tool(s), none callable")
+
+    by_package: dict[str, dict[tuple[str, str, str], list[Tool]]] = {}
+    for tool in tools:
+        pages = by_package.setdefault(tool.package, {})
+        pages.setdefault((tool.section, tool.page_label, tool.page_path), []).append(tool)
+
+    for package, pages in by_package.items():
+        total = sum(len(owned) for owned in pages.values())
+        pnode = root.add(f"{package}   {total} tool(s)")
+        for (section, label, path), owned in pages.items():
+            head = f"[{section}] {label}"
+            if path:
+                head += f"  →  {path}"
+            gnode = pnode.add(f"{head}   {len(owned)} tool(s)")
+            for tool in owned:
+                gnode.children.append(_tool_node(tool))
+    return root
+
+
 # ==========================================================================
 # Main
 # ==========================================================================
@@ -2752,8 +2846,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--no-controls", dest="controls", action="store_false",
                         help="list manifests only; skip the per-page button/input scan")
     parser.add_argument("--tools", action="store_true",
-                        help="list the actions as tools — name, description and input "
-                             "values — instead of the capability tree")
+                        help="show the actions as a tree of mock tools — name, signature, "
+                             "inputs and selectors — instead of the capability tree")
+    parser.add_argument("--flat", action="store_true",
+                        help="with --tools: the detailed one-tool-at-a-time listing "
+                             "instead of the tree")
     parser.add_argument("--insecure", action="store_true",
                         help="do not verify the server's TLS certificate")
     parser.add_argument("--json", action="store_true", help="emit JSON instead of a tree")
@@ -2761,6 +2858,8 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.tools and not args.controls:
         parser.error("--tools needs the per-page scan: drop --no-controls")
+    if args.flat and not args.tools:
+        parser.error("--flat only applies to --tools")
 
     set_target(args.target or os.environ.get("COCKPIT_HOST") or DEFAULT_TARGET)
     if args.insecure:
@@ -2778,11 +2877,15 @@ def main(argv: list[str] | None = None) -> int:
         tools = build_tools(packages)
         if args.json:
             print(tools_to_json(tools))
-        else:
+        elif args.flat:
             render_tools(tools, title)
             print()
-        log(f"{summarise(packages)} → {len(tools)} tool(s), "
-            f"{sum(len(t.params) for t in tools)} input(s)")
+        else:
+            render_tree(build_tools_tree(tools, title))
+            print()
+        log(f"{summarise(packages)} → {len(tools)} mock tool(s), "
+            f"{sum(len(t.params) for t in tools)} input(s), "
+            f"{sum(1 for t in tools if not t.params)} without inputs")
         return 0
 
     if args.json:
