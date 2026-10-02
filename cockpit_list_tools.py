@@ -5,7 +5,8 @@ cockpit_list_tools.py — list the capabilities of a *running* Cockpit server.
 WHAT IT DOES
 ============
 Cockpit's UI is a set of *packages*; each package ships a manifest.json that
-declares its pages (menu/tools/dashboard entries, see doc/packages.md), and
+declares its pages (menu/tools/dashboard entries, see
+doc/modules/guide/pages/packages.adoc), and
 may expose shell commands. That manifest is the coarse-grained "capabilities"
 listing — but it says nothing about what a page actually lets you *do*: the
 buttons you can press and the fields you can fill in.
@@ -57,9 +58,73 @@ first plausible gettext string in the few hundred characters after the element
 says it does X", not the handler's actual semantics — the handler itself is
 minified away.
 
+Dialogs are recovered three times over, because Cockpit has three generations
+of dialog in tree and each leaves a different trace in the bundle:
+
+  * markup — a modal whose props carry an id ({id:"accounts-create-dialog",
+    …}); its fields are the control ids sharing that id's prefix. Its DOM id
+    is the one it declares.
+  * spec — a *description* of the dialog passed to dialog_open({Title,
+    Fields:[TextInput("name", _("Name"), {…}), …], Action}), as
+    pkg/storaged/dialog.jsx does. The fields are listed in the spec itself,
+    tag and label included; the field constructors are renamed by minification
+    but each one renders exactly one data-field-type, so reading those literals
+    back recovers what kind of input a tag really is. Every such dialog lives
+    at #dialog and its fields at [data-field="<tag>"].
+  * state — pkg/lib/cockpit/dialog.tsx, the current idiom: one state object
+    with a handle per input (field={dlg.field("ssid")}), and framework-stamped
+    buttons marked "dialog-apply" / "dialog-cancel" / "dialog-error-message".
+    The handles name the fields, the markers name the buttons. Older builds
+    stamp the markers as a plain id, current ones as an OUIA component id;
+    both are recognised and the selectors follow whichever is in use.
+
+Where the field lists a fixed set of values — choices:[{value, title}] in a
+spec, options:[{value, label}] in the state framework — those are recovered
+too, so a select becomes an enum rather than an open string.
+
+A dialog opened by Dialogs.show(<SomeDialog/>) also names its own opener: the
+component is the only thing linking the button to the dialog once the handler
+is minified, so that button is reported as opening it rather than as an action
+of its own.
+
 This is a heuristic, not a parser: it can miss a control whose handler is
 spread in from a variable, and it can report one that is only rendered
 conditionally. It is accurate enough to answer "what can I do on this page".
+
+THE --tools VIEW
+================
+The tree above is a *map* of the UI: everything that is there, in the shape it
+is in. --tools answers the other question — "which actions can I invoke, and
+what do I have to pass them?" — by re-reading the same findings as a flat list
+of tools, each with a name, a description and its input values (an MCP tool
+definition: name / description / inputSchema, which --tools --json emits
+verbatim, with the Cockpit coordinates of the dialog and controls alongside).
+
+The mapping is:
+
+  * a dialog is an action with inputs — its action captions ("Create",
+    "Delete") say what performing it means, its fields are the inputs, its
+    title describes it. A dialog with two captions is two tools.
+  * a page-level button, menu item or switch is an action without inputs.
+  * a manifest command is a tool whose inputs are its declared args.
+
+Controls that only move around the UI are not actions and are left out, as is
+a dialog's "Cancel". Since the scan attaches to a button whatever plausible
+caption is near it in the bundle, a page-level control additionally has to
+*name* an action — an id like "network-bond-delete", or a caption beginning
+with a verb — or it is dropped as scenery. Input types come from the control
+(checkbox → boolean, NumberInput → integer, everything else a string), and a
+select whose options were recovered carries them as a JSON Schema enum.
+
+Each tool also carries the selectors a caller needs to drive it — the dialog,
+the button that opens it, the one that confirms it, the one that abandons it,
+and one per input. They are the same selectors Cockpit's own browser tests use
+(test/common/dialoglib.py, test/common/storagelib.py), which is what makes them
+worth trusting: a dialog with two confirm buttons ("Create snapshot and mount"
+/ "Create snapshot only") is told apart by position the way the tests do it.
+
+The same caveat applies, one level up: a tool here is an action the UI offers,
+not a verified API call.
 
 DEPENDENCIES
 ============
@@ -75,6 +140,8 @@ USAGE
     COCKPIT_PASSWORD=… ./cockpit_list_tools.py --package systemd
     COCKPIT_PASSWORD=… ./cockpit_list_tools.py --json          # machine readable (for MCP)
     COCKPIT_PASSWORD=… ./cockpit_list_tools.py --no-controls   # manifest only, fast
+    COCKPIT_PASSWORD=… ./cockpit_list_tools.py --tools         # the actions, as tools
+    COCKPIT_PASSWORD=… ./cockpit_list_tools.py --tools --json  # MCP tool definitions
 
     COCKPIT_CA=/path/ca.pem ./cockpit_list_tools.py https://myhost   # pin a CA
     ./cockpit_list_tools.py --insecure https://myhost                # skip verification
@@ -103,6 +170,7 @@ import ssl
 import string
 import struct
 import sys
+import textwrap
 from dataclasses import dataclass, field
 from typing import Any, BinaryIO, Iterator
 
@@ -471,6 +539,10 @@ class Control:
     attrs: dict[str, str] = field(default_factory=dict)
     source: str = ""                # the file it was recovered from
     hint: str | None = None         # best-effort "what this roughly does" (see module docstring)
+    choices: list[tuple[str, str]] = field(default_factory=list)  # (value, caption) of a select
+    conditional: bool = False       # only shown for some values of the other fields
+    selector: str | None = None     # CSS selector that reaches it, when the idiom pins one down
+    opens: str | None = None        # for a button: the dialog component it shows, if resolvable
 
     def key(self) -> tuple[str, str, str]:
         return (self.kind, self.label or "", self.id or "")
@@ -482,9 +554,35 @@ class Control:
         attrs = self.attrs if show_dialog else {k: v for k, v in self.attrs.items() if k != "dialog"}
         if attrs:
             out += "  " + " ".join(f"{k}={v}" for k, v in sorted(attrs.items()))
+        if self.choices:
+            vals = ", ".join(v for v, _ in self.choices)
+            out += f"  one of: {vals[:60]}{'…' if len(vals) > 60 else ''}"
+        if self.conditional:
+            out += "  (conditional)"
+        if self.opens:
+            out += "  opens a dialog"
         if self.hint:
             out += f"  → {self.hint}"
         return out
+
+
+_SLUG_RE = re.compile(r"[^a-z0-9]+")
+
+
+def _slug(text: str) -> str:
+    return _SLUG_RE.sub("_", text.strip().lower()).strip("_")
+
+
+def _humanise(text: str) -> str:
+    """"network-bond-delete" → "Network bond delete" — a title for an unlabelled control."""
+    words = [w for w in re.split(r"[-_./\s]+", text) if w]
+    return " ".join(words).capitalize() if words else text
+
+
+def _dialog_prefix(dialog_id: str) -> str:
+    """The name a dialog's field ids share with it: its id minus ``-dialog``."""
+    return (dialog_id[:-7] if dialog_id.endswith("-dialog")
+            else (dialog_id[:-6] if dialog_id.endswith("dialog") else dialog_id)) or dialog_id
 
 
 @dataclass
@@ -503,9 +601,19 @@ class Subpage:
     actions: list[tuple[str, str]] = field(default_factory=list)  # (caption, style)
     controls: list[Control] = field(default_factory=list)
     fields: list[str] = field(default_factory=list)              # owned field ids
+    field_labels: dict[str, str] = field(default_factory=dict)   # field id → form-group caption
+    framework: str = "markup"        # markup / spec / state — which idiom built it
+    dom_id: str | None = None        # the id the dialog really carries in the DOM
+    selectors: dict[str, str] = field(default_factory=dict)      # how a driver reaches it
+    component: str | None = None     # the (minified) component a button shows to open it
+
+    @property
+    def prefix(self) -> str:
+        """The name this dialog's own field ids start with (its id minus ``-dialog``)."""
+        return _dialog_prefix(self.id)
 
     def render(self) -> str:
-        out = f'subpage "{self.id}"'
+        out = f'subpage "{self.id}" [{self.framework}]'
         if self.title:
             out += f'  — {self.title}'
         if self.actions:
@@ -513,6 +621,8 @@ class Subpage:
         if self.fields:
             ids = ", ".join(self.fields)
             out += f"  fields: {ids[:60]}{'…' if len(ids) > 60 else ''}"
+        if self.selectors.get("dialog"):
+            out += f"  at {self.selectors['dialog']}"
         return out
 
 
@@ -643,11 +753,14 @@ class PageParser(html.parser.HTMLParser):
         kind = tag
         if tag == "input":
             kind = f"input[{attr.get('type', 'text')}]"
+        extra = {k: attr[k] for k in ("type", "name", "placeholder") if attr.get(k)}
+        if "required" in attr:
+            extra["required"] = "true"
         control = Control(
             kind=kind,
             label=attr.get("aria-label") or attr.get("title") or attr.get("value") or None,
             id=attr.get("id") or None,
-            attrs={k: attr[k] for k in ("type", "name", "placeholder") if attr.get(k)},
+            attrs=extra,
             source=self.source,
         )
         self.controls.append(control)
@@ -885,6 +998,8 @@ ANCHOR_PROPS = ("onClick", "onChange", "onSelect", "onToggle", "onSubmit",
 _ANCHOR_RE = re.compile(r"\b(" + "|".join(ANCHOR_PROPS) + r")\s*:")
 
 _CREATE_ELEMENT_RE = re.compile(r"(?:createElement|jsxs?|h)\s*\(\s*([\w$.]+)\s*,\s*$")
+# "isRequired: true", or its minified spelling "isRequired:!0".
+_IS_REQUIRED_RE = re.compile(r"\bisRequired\s*:\s*(?:!0\b|true\b)")
 INPUT_TYPES = ("text", "password", "email", "number", "search", "tel", "url",
                "date", "time", "file", "range")
 
@@ -1015,6 +1130,12 @@ _FIELD_ID_RE = re.compile(r"\b(?:fieldId|htmlFor)\s*:")
 # all under "the page".
 
 _DIALOG_ID_RE = re.compile(r'\bid\s*:\s*"([A-Za-z0-9_\-./]*dialog[A-Za-z0-9_\-./]*)",')
+# ids the dialog state framework stamps on its own buttons — they contain
+# "dialog" and would otherwise read as three further dialogs
+STATE_MARKER_IDS = frozenset(("dialog-apply", "dialog-cancel", "dialog-error-message"))
+# …and the ids it gives their inputs ("dialog-" + "field" + "-" + path). None of
+# them belong to whichever markup dialog happens to share the "dialog" prefix.
+_STATE_OWNED_ID_RE = re.compile(r"^dialog-(apply|cancel|error-message|field-)")
 _FIELD_ID_RE_2 = re.compile(r'\bid\s*:\s*"([A-Za-z0-9_\-./]+)"')
 _TITLE_LIT_RE = re.compile(r'\btitle\s*:\s*(?:[\w.]+\(\s*)?"([^"]+)"')
 _ACTION_CAPTION_RE = re.compile(r'\bcaption\s*:\s*(?:[\w.]+\()?\s*"([^"]+)"')
@@ -1030,8 +1151,7 @@ class _DialogDecl:
     @property
     def prefix(self) -> str:
         """The name a field id shares with this dialog: the id minus ``-dialog``."""
-        return (self.id[:-7] if self.id.endswith("-dialog")
-                else (self.id[:-6] if self.id.endswith("dialog") else self.id)) or self.id
+        return _dialog_prefix(self.id)
 
 
 def _actions_arrays(js: JSSource) -> list[tuple[int, int]]:
@@ -1102,6 +1222,8 @@ def _discover_dialogs(js: JSSource) -> dict[str, _DialogDecl]:
     arrays = _actions_arrays(js)
     positions: list[tuple[int, str, str | None]] = []
     for m in _DIALOG_ID_RE.finditer(js.text):
+        if m.group(1) in STATE_MARKER_IDS:
+            continue        # the state framework's own buttons, not dialogs
         span = js.enclosing_object(m.start())
         lo = span[0] if span else max(0, m.start() - 200)
         hi = span[1] if span else min(len(js.text), m.end() + 200)
@@ -1128,7 +1250,7 @@ def _discover_dialogs(js: JSSource) -> dict[str, _DialogDecl]:
 
 def _owning_dialog(field_id: str, decls: dict[str, _DialogDecl]) -> str | None:
     """Longest dialog whose prefix (id minus ``-dialog``) is a prefix of field_id."""
-    if not field_id or field_id.endswith("dialog"):
+    if not field_id or field_id.endswith("dialog") or _STATE_OWNED_ID_RE.match(field_id):
         return None
     best: tuple[int, str] = (-1, "")
     for did, decl in decls.items():
@@ -1141,21 +1263,28 @@ def _owning_dialog(field_id: str, decls: dict[str, _DialogDecl]) -> str | None:
 
 def _attribute(page_controls: list[Control],
               field_ids: list[str],
-              decls: dict[str, _DialogDecl]
+              decls: dict[str, _DialogDecl],
+              field_labels: dict[str, str]
               ) -> tuple[list[Control], list[Subpage]]:
     """Split the flat control/field set into page controls and per-dialog sub-pages."""
-    subs: dict[str, Subpage] = {did: Subpage(id=did, title=d.title, actions=list(d.actions))
-                                for did, d in decls.items()}
+    # a markup dialog's declared id *is* its DOM id, so it is its own selector
+    subs: dict[str, Subpage] = {
+        did: Subpage(id=did, title=d.title, actions=list(d.actions),
+                     framework="markup", dom_id=did, selectors={"dialog": f"#{did}"})
+        for did, d in decls.items()}
     for cid in field_ids:
         owner = _owning_dialog(cid, decls)
         if owner and owner in subs:
             if cid not in subs[owner].fields:
                 subs[owner].fields.append(cid)
+            if cid in field_labels:
+                subs[owner].field_labels.setdefault(cid, field_labels[cid])
     attributed: set[tuple[str, str, str]] = set()
     for control in page_controls:
         owner = _owning_dialog(control.id or "", decls) if control.id else None
         if owner and owner in subs:
             control.attrs["dialog"] = owner
+            control.selector = f"#{control.id}"
             subs[owner].controls.append(control)
             attributed.add(control.key())
     # synthesise action buttons that were not picked up as plain controls
@@ -1172,6 +1301,635 @@ def _attribute(page_controls: list[Control],
     # page controls = those not attributed to any dialog
     left = [ctrl for ctrl in page_controls if ctrl.key() not in attributed]
     return left, sorted(subs.values(), key=lambda s: s.id)
+
+
+# ===========================================================================
+# Sub-page discovery, second idiom: declarative dialog specs
+# ===========================================================================
+#
+# pkg/storaged/dialog.jsx builds a dialog from a *description* instead of from
+# markup, and most of the destructive actions on a host live there:
+#
+#   dialog_open({ Title: _("Create RAID device"),
+#                 Fields: [ TextInput("name", _("Name"), {…}),
+#                           SelectOne("level", _("RAID level"), {…}),
+#                           CheckBoxes("encrypt", _("Encryption"),
+#                                      { fields: [{tag: "on", title: _("…")}] }) ],
+#                 Action: { Title: _("Create"), Danger: _("…") } })
+#
+# Nothing there is an HTML id, so the prefix attribution above cannot see it —
+# but the spec is better than anything markup gives us: each field arrives as
+# (tag, label) and the Action says what confirming the dialog does. Minifying
+# renames the field constructors but keeps that shape, ident("tag", _("Label"),
+# {…}), so the tag and the label survive; the constructor's *name* does not,
+# which is why the kind falls back to a guess from the label.
+
+_SPEC_FIELDS_RE = re.compile(r"\bFields\s*:\s*\[")
+_SPEC_FIELD_RE = re.compile(
+    r'(?P<ctor>[\w$.]+)\(\s*"(?P<tag>[a-z0-9_.]+)"\s*,\s*(?:[\w$.]+\(\s*)?"(?P<title>[^"]+)"')
+# the sub-fields of a CheckBoxes group: {tag: "nomount", title: _("…")}
+_SPEC_SUBFIELD_RE = re.compile(
+    r'\{\s*tag\s*:\s*"(?P<tag>[\w.-]+)"\s*,\s*[Tt]itle\s*:\s*(?:[\w$.]+\(\s*)?"(?P<title>[^"]+)"')
+_SPEC_ACTION_RE = re.compile(r"\bAction\s*:\s*\{")
+_PASSWORD_RE = re.compile(r"pass(word|phrase)", re.I)
+
+# dialog.jsx's exported field constructors, for the builds that keep their names.
+SPEC_FIELD_KINDS = {
+    "TextInput": "input", "PassInput": "input[password]",
+    "ComboBox": "select", "SelectOne": "select", "SelectOneRadio": "select",
+    "SelectRow": "select", "SelectSpace": "select", "SelectSpaces": "select",
+    "CheckBoxes": "checkbox", "SizeSlider": "input[number]",
+}
+
+# Every field constructor in pkg/storaged/dialog.jsx renders a wrapper carrying
+# ``data-field=<tag>`` and ``data-field-type=<kind>`` — the attributes the test
+# suite drives the dialog through (test/common/storagelib.py: dialog_field,
+# dialog_set_val). Both are plain string literals, so they survive minification
+# even though the constructor's *name* does not: reading the kind out of the
+# constructor body beats guessing it from the field's caption.
+_FIELD_TYPE_RE = re.compile(r'"data-field-type"\s*:\s*"(?P<kind>[ \w-]+)"')
+# "Pe=(e,o,t)=>…" — the shape every field constructor compiles to.
+_CTOR_DEF_RE = re.compile(r"([\w$]+)\s*=\s*\(\s*[\w$]+\s*,\s*[\w$]+\s*,\s*[\w$]+\s*\)\s*=>")
+# a constructor that delegates its markup to a helper component (PassInput does)
+_DELEGATE_RE = re.compile(r"\bcreateElement\s*\(\s*([A-Za-z_$][\w$]*)\s*,")
+# any definition of an identifier, for following that delegation one hop
+# "$" is not a word character, so \b cannot delimit a minified name that
+# starts with one; a negative look-behind over [\w$] can.
+_ANY_DEF_RE = (r"(?:function\s+{0}\s*\(|(?<![\w$]){0}\s*=\s*"
+               r"(?:function\b|\(|[\w$]+\s*=>))")
+
+FIELD_TYPE_KINDS = {
+    "text-input": "input", "text-input-checked": "input",
+    "combobox": "select", "select": "select", "select-radio": "select",
+    "select-row": "select", "select-spaces": "select",
+    "checkbox": "checkbox", "size-slider": "input[number]",
+}
+# markers that tell a text input apart from a password one inside a constructor
+_PASSWORD_MARKUP_RE = re.compile(r'new-password|"password"|:"password"')
+
+# Selectors the test suite uses to drive a storaged dialog. Every spec dialog is
+# rendered by dialog_open() with a literal id of "dialog" (pkg/storaged/
+# dialog.jsx), so the synthesised per-dialog name below is *our* label for it,
+# never a DOM id.
+SPEC_DIALOG_SELECTOR = "#dialog"
+SPEC_CANCEL_SELECTOR = "#dialog button.cancel"
+
+
+def _balanced(masked: str, start: int, opener: str, closer: str) -> tuple[int, int] | None:
+    """Span of the bracket pair that opens at ``start``."""
+    depth = 0
+    for i in range(start, len(masked)):
+        if masked[i] == opener:
+            depth += 1
+        elif masked[i] == closer:
+            depth -= 1
+            if depth == 0:
+                return start, i
+    return None
+
+
+def _assignment_body(masked: str, start: int) -> tuple[int, int]:
+    """Span of the value assigned at ``start``, up to the ',' that ends it.
+
+    Minified bundles are long ``var A=…,B=…,C=…`` chains, so an assignment runs
+    until the first comma (or semicolon) that is not inside a bracket.
+    """
+    depth = 0
+    for i in range(start, len(masked)):
+        char = masked[i]
+        if char in "([{":
+            depth += 1
+        elif char in ")]}":
+            if depth == 0:
+                return start, i
+            depth -= 1
+        elif depth == 0 and char in ",;":
+            return start, i
+    return start, len(masked)
+
+
+def _definition_span(js: JSSource, ident: str) -> tuple[int, int] | None:
+    """Where ``ident``'s definition starts and ends.
+
+    The span has to stop where the definition does: minified bundles pack one
+    component against the next, so a fixed-size window would read a password
+    input's markup as belonging to the plain text input in front of it.
+    """
+    match = re.search(_ANY_DEF_RE.format(re.escape(ident)), js.masked)
+    if match is None:
+        return None
+    head = js.masked[match.start():match.end()].rstrip()
+    after = match.end()
+    if head.endswith("("):                       # function f( … / f=( …
+        after -= 1
+    elif head.endswith("function"):              # f=function( …
+        after = js.masked.find("(", after)
+    if not head.endswith("=>"):                  # step over the parameter list
+        paren = _balanced(js.masked, after, "(", ")") if after >= 0 else None
+        if paren is None:
+            return None
+        after = paren[1] + 1
+    while after < len(js.masked) and js.masked[after].isspace():
+        after += 1
+    if js.masked[after:after + 1] == "{":        # a block body
+        block = _balanced(js.masked, after, "{", "}")
+        if block:
+            return match.start(), block[1] + 1
+    return _assignment_body(js.masked, after)    # a concise arrow body
+
+
+def _definition_body(js: JSSource, ident: str, limit: int = 4000) -> str:
+    """``ident``'s definition, for sniffing what it renders."""
+    span = _definition_span(js, ident)
+    return js.text[span[0]:min(span[1], span[0] + limit)] if span else ""
+
+
+def _spec_kind_map(js: JSSource) -> dict[str, str]:
+    """Minified field-constructor name → control kind, read from its markup.
+
+    Each constructor is a three-argument arrow that renders exactly one
+    ``data-field-type``; PassInput delegates to a helper component, so one hop
+    of indirection is followed. Builds that kept their names fall through to
+    SPEC_FIELD_KINDS instead and never reach here.
+    """
+    kinds: dict[str, str] = {}
+    for match in _CTOR_DEF_RE.finditer(js.masked):
+        name = match.group(1)
+        if name in kinds:
+            continue
+        lo, hi = _assignment_body(js.masked, match.end())
+        body = js.text[lo:hi]
+        type_match = _FIELD_TYPE_RE.search(body)
+        if type_match is None:                   # delegates its markup elsewhere
+            delegate = _DELEGATE_RE.search(body)
+            if delegate is None:
+                continue
+            body = _definition_body(js, delegate.group(1))
+            type_match = _FIELD_TYPE_RE.search(body)
+            if type_match is None:
+                continue
+        kind = FIELD_TYPE_KINDS.get(type_match.group("kind").strip())
+        if not kind:
+            continue
+        if kind == "input" and _PASSWORD_MARKUP_RE.search(body):
+            kind = "input[password]"
+        kinds[name] = kind
+    return kinds
+
+
+def _spec_kind(ctor: str, tag: str, title: str, kind_map: dict[str, str]) -> str:
+    base = ctor.rpartition(".")[2]
+    kind = SPEC_FIELD_KINDS.get(base) or kind_map.get(base)
+    if kind:
+        # the kind map cannot tell a password apart when the constructor shares
+        # its markup with the plain text input, so keep the name-based check
+        if kind == "input" and _PASSWORD_RE.search(f"{tag} {title}"):
+            return "input[password]"
+        return kind
+    if _PASSWORD_RE.search(f"{tag} {title}"):
+        return "input[password]"
+    return "input"
+
+
+def _top_level_value(js: JSSource, lo: int, hi: int, key: str) -> tuple[int, int] | None:
+    """Span of the value of top-level ``key`` in the object literal [lo, hi).
+
+    Only depth zero counts: a ``choices:`` nested inside this field's own
+    ``nested_fields`` belongs to that inner field, not to this one.
+    """
+    masked = js.masked
+    pattern = re.compile(r"\b" + re.escape(key) + r"\s*:")
+    depth, i = 0, lo + 1
+    while i < hi - 1:
+        char = masked[i]
+        if char in "{[(":
+            depth += 1
+        elif char in "}])":
+            depth -= 1
+        elif depth == 0:
+            match = pattern.match(masked, i, hi)
+            if match:
+                value = _after_index(masked, match.end())
+                if value < hi and masked[value] in "[{":
+                    closer = "]" if masked[value] == "[" else "}"
+                    span = _balanced(masked, value, masked[value], closer)
+                    return (span[0], span[1] + 1) if span else None
+                return None
+        i += 1
+    return None
+
+
+def _after_index(text: str, pos: int) -> int:
+    while pos < len(text) and text[pos].isspace():
+        pos += 1
+    return pos
+
+
+# the entries of a storaged ``choices: [{value: "raid0", title: _("RAID 0")}]``
+_CHOICE_RE = re.compile(
+    r'\bvalue\s*:\s*"(?P<value>[^"]*)"\s*,\s*(?:title|label|content)\s*:'
+    r'\s*(?:[\w$.]+\(\s*)?"(?P<caption>[^"]*)"')
+# …and the reverse spelling, {label: "…", value: "…"}
+_CHOICE_REV_RE = re.compile(
+    r'\b(?:title|label|content)\s*:\s*(?:[\w$.]+\(\s*)?"(?P<caption>[^"]*)"\s*,'
+    r'\s*value\s*:\s*"(?P<value>[^"]*)"')
+
+
+def _choices(js: JSSource, span: tuple[int, int] | None) -> list[tuple[str, str]]:
+    """The (value, caption) pairs of a static choice list.
+
+    Many choice lists are computed at runtime (``choices: compute_layout_
+    choices(pvs)``) and yield nothing — the field then stays an open string
+    rather than becoming an enum.
+    """
+    if span is None:
+        return []
+    body = js.text[span[0]:span[1]]
+    out: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for match in list(_CHOICE_RE.finditer(body)) + list(_CHOICE_REV_RE.finditer(body)):
+        value, caption = match.group("value"), match.group("caption")
+        if value in seen:
+            continue
+        seen.add(value)
+        out.append((value, caption))
+    return out
+
+
+def _top_level_objects(masked: str, lo: int, hi: int) -> list[tuple[int, int]]:
+    """Spans of the ``{…}`` objects directly inside [lo, hi)."""
+    out: list[tuple[int, int]] = []
+    depth, start = 0, -1
+    for i in range(lo, hi):
+        if masked[i] == "{":
+            if depth == 0:
+                start = i
+            depth += 1
+        elif masked[i] == "}":
+            depth -= 1
+            if depth == 0 and start >= 0:
+                out.append((start, i + 1))
+                start = -1
+    return out
+
+
+def _spec_actions(js: JSSource, span: tuple[int, int]) -> list[tuple[str, str]]:
+    """What confirming the dialog is called: Action.Title, or its Variants.
+
+    Only the Action's *own* keys count: its ``action`` callback routinely opens
+    further dialogs, and their titles are not captions of this one.
+    """
+    match = _SPEC_ACTION_RE.search(js.masked, *span)
+    if match is None:
+        return []
+    action = _balanced(js.masked, match.end() - 1, "{", "}")
+    if action is None:
+        return []
+    props = js.props(action[0], action[1] + 1)
+    style = "danger" if {"Danger", "DangerButton"} & props.keys() else ""
+
+    captions = [props["Title"]] if props.get("Title") else []
+    if "Variants" in props:            # several ways to confirm the same dialog
+        variants = re.compile(r"\bVariants\s*:\s*\[").search(js.masked, *action)
+        array = _balanced(js.masked, variants.end() - 1, "[", "]") if variants else None
+        if array:
+            for obj in _top_level_objects(js.masked, *array):
+                title = js.props(*obj).get("Title")
+                if title:
+                    captions.append(title)
+
+    out: list[tuple[str, str]] = []
+    for caption in captions:
+        if caption and (caption, style) not in out:
+            out.append((caption, style))
+    return out
+
+
+def _spec_field_options(js: JSSource, after: int, limit: int) -> tuple[int, int] | None:
+    """Span of the options object of a field constructor call.
+
+    ``TextInput("name", _("Name"), {…})`` — from the end of the title literal
+    the only things between us and the options are the gettext call's ')' and
+    the argument comma. Anything else means the call had no options object.
+    """
+    i = after
+    while i < limit:
+        char = js.masked[i]
+        if char.isspace() or char in "),":
+            i += 1
+            continue
+        if char == "{":
+            span = _balanced(js.masked, i, "{", "}")
+            return (span[0], span[1] + 1) if span else None
+        return None
+    return None
+
+
+def _discover_spec_dialogs(js: JSSource, source: str,
+                           kind_map: dict[str, str]) -> list[Subpage]:
+    """Recover the dialogs declared as ``{Title, Fields:[…], Action}`` specs."""
+    out: list[Subpage] = []
+    seen: set[str] = set()
+    for match in _SPEC_FIELDS_RE.finditer(js.masked):
+        array = _balanced(js.masked, match.end() - 1, "[", "]")
+        spec = js.enclosing_object(match.start())
+        if array is None or spec is None:
+            continue
+        title = js.props(*spec).get("Title")
+        actions = _spec_actions(js, spec)
+
+        controls: list[Control] = []
+        labels: dict[str, str] = {}
+        lo, hi = array[0], array[1]
+        for found in _SPEC_FIELD_RE.finditer(js.text, lo, hi):
+            ctor, tag, label = found.group("ctor", "tag", "title")
+            if tag in labels:
+                continue
+            labels[tag] = label
+            options = _spec_field_options(js, found.end(), hi)
+            props = js.props(*options) if options else {}
+            choices = _choices(js, _top_level_value(js, *options, "choices")) if options else []
+            kind = _spec_kind(ctor, tag, label, kind_map)
+            if choices and not kind.startswith("select"):
+                kind = "select"
+            controls.append(Control(
+                kind=kind, label=label, id=tag, source=source,
+                choices=choices,
+                conditional="visible" in props,
+                selector=f'{SPEC_DIALOG_SELECTOR} [data-field="{tag}"]'))
+        for sub in _SPEC_SUBFIELD_RE.finditer(js.text, lo, hi):
+            tag, label = sub.group("tag", "title")
+            if tag in labels:
+                continue
+            labels[tag] = label
+            controls.append(Control(      # a CheckBoxes group's own checkboxes
+                kind="checkbox", label=label, id=tag, source=source,
+                selector=f'{SPEC_DIALOG_SELECTOR} [data-field="{tag}"]'))
+        if not controls and not actions:
+            continue
+
+        # a spec dialog has no id of its own; name it after its title, in the
+        # same shape as the ids the markup-declared dialogs carry
+        base = _slug(title or (actions[0][0] if actions else "")).replace("_", "-") or "dialog"
+        dialog_id = f"{base}-dialog"
+        n = 2
+        while dialog_id in seen:                 # two dialogs can share a title
+            dialog_id, n = f"{base}-{n}-dialog", n + 1
+        seen.add(dialog_id)
+        # every storaged dialog is rendered as "#dialog"; the apply buttons are
+        # in footer order, which is the order the captions were recovered in.
+        selectors = {"dialog": SPEC_DIALOG_SELECTOR, "cancel": SPEC_CANCEL_SELECTOR}
+        for i, (caption, _style) in enumerate(actions, start=1):
+            selectors[f"action:{caption}"] = f"#dialog button.apply:nth-of-type({i})"
+        out.append(Subpage(id=dialog_id, title=title, actions=actions,
+                           controls=controls, fields=list(labels),
+                           field_labels=labels, framework="spec",
+                           dom_id="dialog", selectors=selectors))
+    return out
+
+
+# ===========================================================================
+# Sub-page discovery, third idiom: the dialog state framework
+# ===========================================================================
+#
+# pkg/lib/cockpit/dialog.tsx ("Dialog Implementation Convenience Kit") is the
+# idiom new Cockpit dialogs are written in. It has neither an id-prefixed field
+# convention nor a declarative spec; instead all of the dialog's state lives in
+# one object and each input is bound to a *handle* into it:
+#
+#   const dlg = useDialogState({ ssid: "", security: "none", password: "" });
+#   …
+#   <Modal isOpen onClose={Dialogs.close}>
+#     <DialogTextInput      label={_("Network name")} field={dlg.field("ssid")} />
+#     <DialogDropdownSelect label={_("Security")}     field={dlg.field("security")}
+#                           options={[{value: "none", label: _("None")}, …]} />
+#     <DialogActionButton dialog={dlg} action={apply}>{_("Connect")}</DialogActionButton>
+#     <DialogCancelButton dialog={dlg} />
+#   </Modal>
+#
+# Two things survive minification intact: the ``field: X.field("ssid")`` prop,
+# whose literal is the field's path through the state object, and the marker
+# the framework stamps on its own buttons — "dialog-apply", "dialog-cancel" and
+# "dialog-error-message". The markers identify the porcelain components by
+# name, which in turn identifies the confirm button and its caption without
+# having to guess from a list of English words; the handles give the inputs,
+# the "options" prop gives their allowed values.
+#
+# The same markers are what the tests drive the dialog through
+# (test/common/dialoglib.py), so they double as the selectors a caller needs.
+# Older builds stamp them as a plain "id", current ones as an OUIA component
+# id; both spellings are recognised and the selector follows suit.
+
+_STATE_MARKER_RE = re.compile(
+    r'\b(?P<attr>ouiaId|id)\s*:\s*"dialog-(?P<role>apply|cancel|error-message)"')
+# "field: dlg.field("ssid")", or a nested "dlg.field("addresses").sub(0)"
+_FIELD_PROP_RE = re.compile(
+    r'\bfield\s*:\s*[\w$]+((?:\.(?:field|sub)\(\s*"[\w.-]+"\s*\))+)')
+_HANDLE_STEP_RE = re.compile(r'\.(?:field|sub)\(\s*"([\w.-]+)"\s*\)')
+_CE_PROPS_RE = re.compile(r"\b(?:createElement|jsxs?|h)\s*\(\s*([\w$.]+)\s*,\s*\{")
+# a definition that a backwards search can name: "function f(", "f=(", "f=x=>"
+_DEF_NAME_RE = re.compile(
+    r"(?:\bfunction\s+(?P<fn>[\w$]+)\s*\(|(?<![\w$])(?P<var>[\w$]+)\s*=\s*"
+    r"(?:function\b|\(|[\w$]+\s*=>))")
+# "Dialogs.show(<SomeDialog …/>)" — how a button reaches a dialog component
+_SHOW_DIALOG_RE = re.compile(r"\.show\(\s*[\w$.]+\.createElement\(\s*([\w$]+)")
+# a modal id built from a local constant: id: prefix + "-dialog"
+_ID_CONCAT_RE = re.compile(r'\bid\s*:\s*([\w$]+)\s*\+\s*"([^"]*)"')
+
+
+def _def_positions(js: JSSource) -> list[tuple[int, str]]:
+    """Every (position, name) a definition starts at, in source order."""
+    out: list[tuple[int, str]] = []
+    for match in _DEF_NAME_RE.finditer(js.masked):
+        out.append((match.start(), match.group("fn") or match.group("var")))
+    return out
+
+
+def _enclosing_def(defs: list[tuple[int, str]], pos: int) -> str | None:
+    """Name of the innermost definition that starts before ``pos``."""
+    index = bisect.bisect_right(defs, (pos, "￿")) - 1
+    return defs[index][1] if index >= 0 else None
+
+
+def _dialog_components(js: JSSource) -> list[tuple[int, int, str]]:
+    """(start, end, name) of every component some button passes to Dialogs.show().
+
+    This is the only link between a dialog and the control that opens it, and
+    it is read from the opener's side on purpose: searching backwards from the
+    dialog's own markup would land on whichever local arrow function happens
+    to be defined last, not on the component the markup belongs to.
+    """
+    out: list[tuple[int, int, str]] = []
+    for name in {m.group(1) for m in _SHOW_DIALOG_RE.finditer(js.masked)}:
+        span = _definition_span(js, name)
+        if span:
+            out.append((span[0], span[1], name))
+    return out
+
+
+def _state_porcelain(js: JSSource,
+                     defs: list[tuple[int, str]]) -> tuple[dict[str, str], str]:
+    """Map the framework's button components to their role, and say how marked.
+
+    Returns ``({ident: "apply"|"cancel"|"error-message"}, "id"|"ouiaId")``.
+    """
+    roles: dict[str, str] = {}
+    attr = "ouiaId"
+    # the markers are string literals, so they are only legible in the raw text
+    for match in _STATE_MARKER_RE.finditer(js.text):
+        attr = match.group("attr")
+        name = _enclosing_def(defs, match.start())
+        if name:
+            roles[name] = match.group("role")
+    return roles, attr
+
+
+def _modal_calls(js: JSSource) -> list[tuple[int, int, tuple[int, int]]]:
+    """(call start, call end, props span) of every ``<Modal isOpen onClose=…>``."""
+    out: list[tuple[int, int, tuple[int, int]]] = []
+    for match in _CE_PROPS_RE.finditer(js.masked):
+        brace = match.end() - 1
+        props_span = _balanced(js.masked, brace, "{", "}")
+        if props_span is None:
+            continue
+        props = js.props(props_span[0], props_span[1] + 1)
+        if "isOpen" not in props or "onClose" not in props:
+            continue
+        paren = js.masked.find("(", match.start())
+        call = _balanced(js.masked, paren, "(", ")")
+        if call is None:
+            continue
+        out.append((call[0], call[1], (props_span[0], props_span[1] + 1)))
+    return out
+
+
+def _state_field_kind(js: JSSource, component: str | None,
+                      props: dict[str, str | None], has_choices: bool) -> str:
+    """What kind of input a porcelain component renders.
+
+    The component's own name is minified away, so its *body* is read instead:
+    a password input is the only one that renders a "password" type, and a
+    checkbox the only one that drives ``isChecked`` without a list of options.
+    """
+    if has_choices or "options" in props:
+        return "select"
+    body = _definition_body(js, component) if component else ""
+    if _PASSWORD_MARKUP_RE.search(body):
+        return "input[password]"
+    if "isChecked" in body:
+        return "checkbox"
+    return "input"
+
+
+def _state_selector(attr: str, tag: str) -> str:
+    name = f"dialog-{tag}"
+    return f"#{name}" if attr == "id" else f"[data-ouia-component-id='{name}']"
+
+
+def _resolve_modal_id(js: JSSource, props_span: tuple[int, int],
+                      call_start: int) -> str | None:
+    """The id a modal really carries, including ``id={prefix + "-dialog"}``."""
+    literal = js.props(*props_span).get("id")
+    if literal:
+        return literal
+    concat = _ID_CONCAT_RE.search(js.text, *props_span)
+    if concat is None:
+        return None
+    variable, suffix = concat.group(1), concat.group(2)
+    # the constant is assigned inside the component, just above the markup
+    assign = None
+    for found in re.finditer(r"\b" + re.escape(variable) + r'\s*=\s*"',
+                             js.masked, 0):
+        if found.end() <= call_start and found.start() > call_start - 6000:
+            assign = found
+    if assign is None:
+        return None
+    value = js._string_at(assign.end() - 1)
+    return f"{value}{suffix}" if value else None
+
+
+def _discover_state_dialogs(js: JSSource, source: str) -> list[Subpage]:
+    """Recover the dialogs built with useDialogState + the Dialog* porcelain."""
+    defs = _def_positions(js)
+    roles, attr = _state_porcelain(js, defs)
+    if not roles:
+        return []
+    components = _dialog_components(js)
+    apply_idents = {name for name, role in roles.items() if role == "apply"}
+    cancel_idents = {name for name, role in roles.items() if role == "cancel"}
+
+    out: list[Subpage] = []
+    seen: set[str] = set()
+    for call_start, call_end, props_span in _modal_calls(js):
+        controls: list[Control] = []
+        labels: dict[str, str] = {}
+        actions: list[tuple[str, str]] = []
+
+        for found in _FIELD_PROP_RE.finditer(js.text, call_start, call_end):
+            tag = ".".join(_HANDLE_STEP_RE.findall(found.group(1)))
+            if not tag or tag in labels:
+                continue
+            span = js.enclosing_object(found.start())
+            if span is None:
+                continue
+            props = js.props(*span)
+            component = _enclosing_component(js, span[0])
+            choices = _choices(js, _top_level_value(js, span[0], span[1], "options"))
+            label = next((props[p] for p in LABEL_PROPS if props.get(p)), None)
+            labels[tag] = label or _humanise(tag)
+            controls.append(Control(
+                kind=_state_field_kind(js, component, props, bool(choices)),
+                label=label, id=tag, source=source, choices=choices,
+                attrs={"required": "true"} if "isRequired" in props else {},
+                selector=_state_selector(attr, f"field-{tag}")))
+
+        for found in _CE_PROPS_RE.finditer(js.masked, call_start, call_end):
+            name = found.group(1).rpartition(".")[2]
+            if name not in apply_idents and name not in cancel_idents:
+                continue
+            props_end = _balanced(js.masked, found.end() - 1, "{", "}")
+            if props_end is None:
+                continue
+            caption = js.child_string(props_end[1] + 1,
+                                      min(len(js.text), props_end[1] + 300))
+            if name in cancel_idents:
+                continue               # the framework's own abandon button
+            style = "danger" if js.props(found.end() - 1, props_end[1] + 1)\
+                .get("variant") == "danger" else ""
+            if caption and (caption, style) not in actions:
+                actions.append((caption, style))
+
+        if not controls and not actions:
+            continue
+
+        dom_id = _resolve_modal_id(js, props_span, call_start)
+        title = _TITLE_LIT_RE.search(js.text[call_start:call_end])
+        caption = title.group(1) if title else js.child_string(props_span[1], call_end)
+        base = (_dialog_prefix(dom_id) if dom_id
+                else _slug(caption or (actions[0][0] if actions else "")).replace("_", "-"))
+        dialog_id = f"{base or 'dialog'}-dialog"
+        n = 2
+        while dialog_id in seen:
+            dialog_id, n = f"{base}-{n}-dialog", n + 1
+        seen.add(dialog_id)
+
+        selectors = {"dialog": f"#{dom_id}" if dom_id else ".pf-v6-c-modal-box",
+                     "apply": _state_selector(attr, "apply"),
+                     "cancel": _state_selector(attr, "cancel"),
+                     "error": _state_selector(attr, "error-message")}
+        out.append(Subpage(id=dialog_id, title=caption, actions=actions,
+                           controls=controls, fields=list(labels),
+                           field_labels=labels, framework="state",
+                           dom_id=dom_id, selectors=selectors,
+                           component=next((name for lo, hi, name in components
+                                           if lo <= call_start < hi), None)))
+    return out
+
+
+def _enclosing_component(js: JSSource, props_start: int) -> str | None:
+    """The component of ``createElement(C, {…})`` whose props start here."""
+    match = _CREATE_ELEMENT_RE.search(js.masked, max(0, props_start - 60), props_start)
+    return match.group(1).rpartition(".")[2] if match else None
 
 
 def _field_labels(js: JSSource) -> dict[str, str]:
@@ -1229,13 +1987,23 @@ def scan_js(text: str, source: str) -> tuple[list[Control], list[Subpage]]:
             label = js.child_string(end, min(len(js.text), end + 400))
 
         cid = props.get("id")
+        attrs = {k: props[k] for k in ("variant", "type", "name", "placeholder")
+                 if props.get(k)}
+        # isRequired is a boolean prop, so props() has no value for it; read the
+        # literal from the object itself ("isRequired:!0" is a minified true).
+        if "isRequired" in props and _IS_REQUIRED_RE.search(js.masked, start, end):
+            attrs["required"] = "true"
         control = Control(
             kind=kind,
             label=label,
             id=cid,
-            attrs={k: props[k] for k in ("variant", "type", "name") if props.get(k)},  # type: ignore[misc]
+            attrs=attrs,  # type: ignore[arg-type]
             source=source,
             hint=_purpose_hint(js, end, label, cid) if kind in HINT_KINDS else None,
+            # Dialogs.show(<SomeDialog/>) in the handler names the dialog this
+            # button opens — the only link between the two in minified code.
+            opens=(shows.group(1) if (shows := _SHOW_DIALOG_RE.search(js.masked, start, end))
+                   else None),
         )
         found.setdefault(control.key(), control)
         if control.id and control.id not in field_ids:
@@ -1253,7 +2021,22 @@ def scan_js(text: str, source: str) -> tuple[list[Control], list[Subpage]]:
 
     page_controls = sorted(found.values(), key=Control.key)
     decls = _discover_dialogs(js)
-    return _attribute(page_controls, field_ids, decls)
+    left, subpages = _attribute(page_controls, field_ids, decls, field_labels)
+    # Dialogs built from a spec or from dialog state are already complete: they
+    # own their fields outright and so take part in no prefix attribution.
+    subpages += _discover_spec_dialogs(js, source, _spec_kind_map(js))
+    state = _discover_state_dialogs(js, source)
+    subpages += state
+
+    # a button whose handler shows one of those components opens that dialog
+    by_component = {s.component: s.id for s in state if s.component}
+    for control in left:
+        if control.opens and control.opens in by_component:
+            control.attrs["opens"] = by_component[control.opens]
+            control.opens = by_component[control.opens]
+        else:
+            control.opens = None
+    return left, sorted(subpages, key=lambda s: s.id)
 
 
 # ==========================================================================
@@ -1319,6 +2102,8 @@ def introspect_page(pkg: str, page: Page, assets: AssetFetcher) -> None:
         for f in sub.fields:
             if f not in existing.fields:
                 existing.fields.append(f)
+        for fid, flabel in sub.field_labels.items():
+            existing.field_labels.setdefault(fid, flabel)
     page.subpages = sorted(by_id.values(), key=lambda s: s.id)
 
 
@@ -1418,6 +2203,534 @@ def summarise(packages: list[Package]) -> str:
 
 
 # ==========================================================================
+# Tool synthesis: the same findings, as callable tools
+# ==========================================================================
+#
+# The tree above is a *map* of the UI. A caller that wants to act on the host
+# needs something else: a flat list of the actions it can take, each with a
+# name, a description of what it does, and the values it needs to be given —
+# i.e. an MCP tool definition (name / description / inputSchema).
+#
+# The mapping from what we recovered to that shape:
+#
+#   * a dialog is an action with inputs. Its non-cancel action captions say
+#     what performing it means ("Create", "Delete"), its fields are the input
+#     values, its title is the description. One tool per action caption, since
+#     a dialog offering both "Rename" and "Delete" is two different actions.
+#   * a page-level button or menu item is an action without inputs: pressing
+#     it is the whole operation (a page-level switch takes one boolean).
+#   * a manifest command is a tool whose inputs are its declared args.
+#
+# Controls that only navigate, filter or fold the view are not actions, and
+# are dropped (NON_ACTION_LABELS) — as are a dialog's "Cancel"/"Close".
+#
+# Input *types* are inferred from the control: a checkbox is a boolean, a
+# NumberInput an integer, everything else a string. Select options are not
+# recovered, so a select is an unconstrained string rather than an enum.
+
+# Kinds that take a value from the user: the inputs of a tool.
+PARAM_KINDS = frozenset(("checkbox", "switch", "radio", "select", "textarea", "slider"))
+
+# Kinds that *do* something when pressed: the tools themselves.
+ACTION_KINDS = frozenset(("button", "menu-item"))
+
+# Dialog actions that abandon the dialog instead of performing it.
+CANCEL_CAPTIONS = frozenset(("cancel", "close", "dismiss", "back", "never mind"))
+
+# Labels of controls that move around the UI rather than change the host.
+NON_ACTION_LABELS = frozenset((
+    "cancel", "close", "dismiss", "back", "next", "previous", "continue",
+    "ok", "done", "yes", "no", "help", "learn more", "read more",
+    "show more", "show less", "view more", "view all", "see more",
+    "expand", "collapse", "expand all", "collapse all", "toggle",
+    "search", "filter", "clear filters", "clear all filters", "refresh",
+    "menu", "more", "more options", "options", "details", "overview", "home",
+    "loading", "select", "select all", "deselect all", "sort", "copy",
+))
+
+# A page-level control is only an action if it says so: either its id names an
+# action verb (ACTION_VERBS, used for the purpose hints) or its caption starts
+# with one of these. Without such a gate the listing fills up with the strings
+# the control scan attaches to a button from its surroundings — column headers
+# ("UUID", "Mount point"), statuses ("No carrier", "Synchronized") and field
+# captions, none of which do anything. Navigation verbs (view, go to) are
+# deliberately absent: they move around the UI, they don't change the host.
+TOOL_VERBS = frozenset(ACTION_VERBS) | frozenset((
+    "abort", "activate", "allow", "assign", "authenticate", "deactivate",
+    "deny", "disallow", "dismiss", "download", "erase", "fill", "force",
+    "forget", "format", "generate", "grant", "grow", "join", "leave", "limit",
+    "lock", "log", "manage", "mask", "mount", "pause", "pin", "reapply",
+    "register", "regenerate", "rename", "repair", "replace", "restore",
+    "resume", "resize", "revoke", "run", "scan", "send", "set", "shrink",
+    "shut", "switch", "terminate", "test", "troubleshoot", "trust", "undo",
+    "unlock", "unmask", "unmount", "unpin", "unregister", "upload", "validate",
+    "wipe",
+))
+
+# Labels belonging to the UI's own machinery — PatternFly's a11y captions for
+# menus, drag handles and clear buttons, and the keyboard keys its shortcut
+# help names. They are controls, but not actions on the host.
+_UI_NOISE_RE = re.compile(
+    r"\b(toggle|dropdown|kebab|draggable|caret|chevron|breadcrumb|tooltip|popover|"
+    r"sidebar|scrollbar|pagination|input value|escape|tab|enter|backspace)\b", re.I)
+
+# Words that carry no meaning in a dialog id ("account-confirm-delete").
+_FILLER_TOKENS = frozenset(("confirm", "dialog", "modal", "popup", "the", "a", "an"))
+
+# Names that make an input a number rather than a string.
+_INT_PARAM_RE = re.compile(
+    r"\b(uid|gid|port|size|count|quota|priority|limit|days?|hours?|minutes?|seconds?|"
+    r"timeout|interval|number|percent|mtu|vlan|index|id)\b")
+
+@dataclass
+class ToolParam:
+    """One input value of a tool, with the control it is typed into."""
+    name: str
+    type: str                       # JSON Schema type: string / boolean / integer
+    description: str
+    required: bool = False
+    control_id: str | None = None
+    kind: str = ""                  # the control kind it came from
+    choices: list[tuple[str, str]] = field(default_factory=list)  # (value, caption)
+    selector: str | None = None     # CSS selector that reaches the control
+
+    def schema(self) -> dict[str, Any]:
+        out: dict[str, Any] = {"type": self.type}
+        if self.description:
+            out["description"] = self.description
+        if self.choices:
+            out["enum"] = [value for value, _ in self.choices]
+            captions = ", ".join(f"{value} ({caption})" if caption != value else value
+                                 for value, caption in self.choices)
+            said = (out.get("description") or "").rstrip(" .")
+            out["description"] = f"{said}. One of: {captions}." if said \
+                else f"One of: {captions}."
+        if self.kind.startswith("input[password]"):
+            out["format"] = "password"
+        return out
+
+    def render(self, width: int) -> str:
+        flag = "required" if self.required else "optional"
+        out = f"{self.name:<{width}}  {self.type:<7}  {flag:<8}"
+        if self.description:
+            out += f"  {self.description}"
+        if self.choices:
+            out += "  one of: " + ", ".join(value for value, _ in self.choices)
+        if self.control_id:
+            out += f"  [#{self.control_id}]"
+        return out
+
+
+@dataclass
+class Tool:
+    """An action a caller can perform, in MCP tool shape."""
+    name: str
+    title: str
+    description: str
+    package: str
+    page_label: str
+    page_path: str
+    section: str
+    params: list[ToolParam] = field(default_factory=list)
+    dialog: str | None = None       # the dialog that performs it, if any
+    action: str | None = None       # the caption of the confirming button
+    opens_via: str | None = None    # the control that reaches the dialog
+    control_id: str | None = None   # the control that *is* the action
+    destructive: bool = False
+    framework: str = ""             # the dialog idiom: markup / spec / state
+    selectors: dict[str, str] = field(default_factory=dict)  # how to drive it
+
+    def input_schema(self) -> dict[str, Any]:
+        schema: dict[str, Any] = {
+            "type": "object",
+            "properties": {p.name: p.schema() for p in self.params},
+        }
+        required = [p.name for p in self.params if p.required]
+        if required:
+            schema["required"] = required
+        schema["additionalProperties"] = False
+        return schema
+
+    def to_json(self) -> dict[str, Any]:
+        """MCP tool definition, plus the Cockpit coordinates needed to drive it."""
+        return {
+            "name": self.name,
+            "title": self.title,
+            "description": self.description,
+            "inputSchema": self.input_schema(),
+            "annotations": {"destructiveHint": self.destructive},
+            "cockpit": {
+                "package": self.package,
+                "section": self.section,
+                "page": self.page_label,
+                "path": self.page_path,
+                "dialog": self.dialog,
+                "action": self.action,
+                "opens_via": self.opens_via,
+                "control": self.control_id,
+                "framework": self.framework or None,
+                "selectors": self.selectors or None,
+                "inputs": [{"name": p.name, "control": p.control_id, "kind": p.kind,
+                            "selector": p.selector}
+                           for p in self.params],
+            },
+        }
+
+
+def _is_param(kind: str) -> bool:
+    return kind.startswith("input") or kind in PARAM_KINDS
+
+
+def _param_type(kind: str, name: str, label: str | None) -> str:
+    if kind in ("checkbox", "switch", "radio"):
+        return "boolean"
+    if kind in ("input[number]", "input[range]", "slider"):
+        return "integer"
+    if _INT_PARAM_RE.search(f"{name} {label or ''}".lower()):
+        return "integer"
+    return "string"
+
+
+def _param_name(control_id: str | None, label: str | None, prefix: str) -> str:
+    """Name an input after its id with the dialog's own prefix stripped off.
+
+    ``accounts-create-real-name`` in ``accounts-create-dialog`` → ``real_name``.
+    """
+    base = control_id or ""
+    if prefix and base.startswith(prefix):
+        base = base[len(prefix):]
+    return _slug(base) or _slug(label or "") or "value"
+
+
+def _make_param(control_id: str | None, label: str | None, kind: str,
+                prefix: str, required: bool, placeholder: str | None = None,
+                choices: list[tuple[str, str]] | None = None,
+                selector: str | None = None) -> ToolParam:
+    name = _param_name(control_id, label, prefix)
+    description = label or _humanise(name)
+    if placeholder and placeholder.strip().lower() != description.strip().lower():
+        description += f" (e.g. {placeholder})"
+    return ToolParam(
+        name=name,
+        # a recovered choice list pins the type down: it is whatever the
+        # values are, never the integer the name alone would suggest
+        type="string" if choices else _param_type(kind, name, label),
+        description=description,
+        required=required,
+        control_id=control_id,
+        kind=kind,
+        choices=list(choices or []),
+        selector=selector,
+    )
+
+
+def _dialog_params(sub: Subpage) -> list[ToolParam]:
+    """The input values a dialog asks for: its own controls, then its bare fields."""
+    prefix = sub.prefix
+    params: dict[str, ToolParam] = {}
+    for control in sub.controls:
+        if not _is_param(control.kind):
+            continue
+        param = _make_param(control.id, control.label, control.kind, prefix,
+                            required=control.attrs.get("required") == "true",
+                            placeholder=control.attrs.get("placeholder"),
+                            choices=control.choices, selector=control.selector)
+        params.setdefault(param.name, param)
+    # fields the ownership pass found but no control was recovered for: they
+    # are real inputs whenever a form group gave them a caption.
+    have = {c.id for c in sub.controls if c.id}
+    for field_id in sub.fields:
+        label = sub.field_labels.get(field_id)
+        if field_id in have or not label:
+            continue
+        param = _make_param(field_id, label, "input", prefix, required=False)
+        params.setdefault(param.name, param)
+    return sorted(params.values(), key=lambda p: (not p.required, p.name))
+
+
+def _useful_hint(hint: str | None, label: str) -> str | None:
+    """Keep a purpose hint only where it says more than the label already does.
+
+    _purpose_hint() is deliberately generous; for a tool description most of
+    what it returns is noise — the label again, a neighbouring "Cancel", the
+    "a delete action" restatement of the id, or a fragment of minified code.
+    """
+    text = (hint or "").strip()
+    low = text.lower()
+    if not text or low == label.strip().lower():
+        return None
+    if low in NON_ACTION_LABELS or low in CANCEL_CAPTIONS:
+        return None
+    if text.startswith("a ") and text.endswith(" action"):
+        return None                    # only restates the verb in the id
+    if not text[0].isupper() or _UI_NOISE_RE.search(text):
+        return None
+    if " " not in text and (_label_verb(label) or "\0") not in low:
+        return None                    # a lone neighbouring word ("Name", "Actions")
+    return text
+
+
+def _is_noise(label: str) -> bool:
+    return len(label.strip()) < 3 or bool(_UI_NOISE_RE.search(label))
+
+
+def _label_verb(label: str) -> str | None:
+    """The leading verb of a caption ("Shut down" → shut), if it names an action."""
+    first = _slug(label).partition("_")[0]
+    return first if first in TOOL_VERBS else None
+
+
+def _dialog_title(sub: Subpage, entry: Control | None, caption: str | None) -> str:
+    """Name the action a dialog performs.
+
+    Most dialogs carry a title; the confirm-style ones do not, and their id is
+    the only description there is. Reading it verb-first against the action
+    caption turns "account-confirm-delete" + "Delete" into "Delete account".
+    """
+    if sub.title:
+        return sub.title
+    if entry and entry.label:
+        return entry.label
+    if not caption:
+        return _humanise(sub.prefix)
+    spelling = _slug(caption).replace("_", "")
+    rest = [token for token in re.split(r"[-_./\s]+", sub.prefix)
+            if token and token.lower() not in _FILLER_TOKENS and token.lower() not in spelling]
+    return f"{caption} {' '.join(rest)}" if rest else caption
+
+
+def _entry_control(sub: Subpage, page: Page | None = None) -> Control | None:
+    """The button that opens this dialog.
+
+    A dialog built with the state framework says so outright — its opener runs
+    ``Dialogs.show(<ThatDialog/>)``, which the scan resolved back to the
+    dialog's id. The older idioms have no such link, and the convention that
+    the opener carries the dialog's prefix as its id is all there is.
+    """
+    for control in (page.controls if page else []):
+        if control.opens == sub.id:
+            return control
+    fallback = None
+    for control in sub.controls:
+        if control.kind != "button" or not control.id:
+            continue
+        if control.id == sub.prefix:
+            return control
+        fallback = fallback or control
+    return fallback
+
+
+def _unique(name: str, used: set[str]) -> str:
+    name = name or "action"
+    candidate, n = name, 2
+    while candidate in used:
+        candidate, n = f"{name}_{n}", n + 1
+    used.add(candidate)
+    return candidate
+
+
+def _tool_name(package: str, parts: list[str], used: set[str]) -> str:
+    name = "_".join(s for s in (_slug(p) for p in parts if p) if s)
+    pkg = _slug(package)
+    if name != pkg and not name.startswith(f"{pkg}_"):
+        name = f"{pkg}_{name}" if name else pkg
+    return _unique(name, used)
+
+
+def _where(pkg: Package, page: Page) -> str:
+    return f"Page “{page.label}” ({page.section}) of package {pkg.name}, {page.path}."
+
+
+def _dialog_tools(pkg: Package, page: Page, sub: Subpage,
+                  used: set[str], covered: set[str]) -> list[Tool]:
+    """One tool per non-cancel action of a dialog; its fields are the inputs."""
+    params = _dialog_params(sub)
+    entry = _entry_control(sub, page)
+    captions = [(c, s) for c, s in sub.actions if c.strip().lower() not in CANCEL_CAPTIONS]
+    if not captions and not params:
+        return []                      # nothing to perform and nothing to fill in
+
+    for label in (sub.title, entry.label if entry else None):
+        if label:
+            covered.add(label.strip().lower())
+
+    base = sub.prefix
+    out: list[Tool] = []
+    for caption, style in captions or [(None, "")]:
+        if caption:
+            covered.add(caption.strip().lower())
+        title = _dialog_title(sub, entry, caption)
+        if caption and len(captions) > 1 and caption.lower() not in title.lower():
+            title = f"{title}: {caption}"
+
+        description = f"{title.rstrip('.')}. "
+        description += (f"Performed by pressing “{caption}” in the Cockpit dialog "
+                        f"“{sub.id}”. " if caption else
+                        f"Filled in and submitted in the Cockpit dialog “{sub.id}”. ")
+        if entry and entry.label:
+            description += f"The dialog is opened from the “{entry.label}” control. "
+        if style == "danger":
+            description += "Destructive: it removes or disrupts what it acts on. "
+        description += _where(pkg, page)
+
+        out.append(Tool(
+            name=_tool_name(pkg.name, [base, caption if len(captions) > 1 else ""], used),
+            title=title,
+            description=description,
+            package=pkg.name,
+            page_label=page.label,
+            page_path=page.path,
+            section=page.section,
+            params=params,
+            dialog=sub.id,
+            action=caption,
+            # an opener found through Dialogs.show() often has no id of its
+            # own; its caption is then the only handle on it
+            opens_via=(entry.id or entry.label) if entry else None,
+            destructive=style == "danger",
+            framework=sub.framework,
+            selectors=_tool_selectors(sub, caption, entry),
+        ))
+    return out
+
+
+def _tool_selectors(sub: Subpage, caption: str | None,
+                    entry: Control | None) -> dict[str, str]:
+    """The selectors a caller needs to drive one action of a dialog.
+
+    Which button confirms depends on the caption, because a spec dialog with
+    two variants ("Create snapshot and mount" / "Create snapshot only")
+    renders them as two apply buttons that only their position tells apart.
+    """
+    out = {k: v for k, v in sub.selectors.items() if not k.startswith("action:")}
+    if caption and f"action:{caption}" in sub.selectors:
+        out["apply"] = sub.selectors[f"action:{caption}"]
+    if entry and entry.selector:
+        out["open"] = entry.selector
+    elif entry and entry.id:
+        out["open"] = f"#{entry.id}"
+    return out
+
+
+def _page_tools(pkg: Package, page: Page, used: set[str], covered: set[str]) -> list[Tool]:
+    """Page-level buttons and switches: an action that needs no dialog."""
+    out: list[Tool] = []
+    for control in page.controls:
+        if control.kind not in ACTION_KINDS and control.kind != "switch":
+            continue
+        if control.opens:
+            continue                   # it only opens a dialog, which is its own tool
+        label = (control.label or "").strip()
+        key = label.lower()
+        verb = _id_verb(control.id)
+        if key in covered or key in NON_ACTION_LABELS:
+            continue
+        if not label and not verb:
+            continue                   # unlabelled and not named after an action
+        title = label or _humanise(control.id or "")
+        if _is_noise(title):
+            continue                   # a drag handle, a menu toggle, a key name
+        # a switch is an action whatever it is called; a button has to say so
+        if control.kind != "switch" and not verb and not _label_verb(title):
+            continue
+        if key:
+            covered.add(key)
+
+        params: list[ToolParam] = []
+        if control.kind == "switch":
+            params = [ToolParam(name="enabled", type="boolean",
+                                description=f"whether “{title}” is on",
+                                required=True, control_id=control.id, kind=control.kind)]
+
+        description = f"{title.rstrip('.')}. "
+        what = {"button": "Presses", "menu-item": "Selects the menu entry",
+                "switch": "Flips the switch"}[control.kind]
+        description += f"{what} “{title}” directly on the page"
+        description += f" (#{control.id}). " if control.id else ". "
+        hint = _useful_hint(control.hint, title)
+        if hint:
+            description += f"Nearby text suggests it relates to: {hint}. "
+        description += _where(pkg, page)
+
+        out.append(Tool(
+            name=_tool_name(pkg.name, [title or control.id or ""], used),
+            title=title,
+            description=description,
+            package=pkg.name,
+            page_label=page.label,
+            page_path=page.path,
+            section=page.section,
+            params=params,
+            control_id=control.id,
+            destructive=verb in ("delete", "remove", "reboot", "shutdown", "stop"),
+            selectors={"control": control.selector or f"#{control.id}"} if control.id
+                      or control.selector else {},
+        ))
+    return out
+
+
+def _command_tool(pkg: Package, cmd: Command, used: set[str]) -> Tool:
+    params = [
+        ToolParam(name=_slug(arg) or f"arg{i + 1}", type="string",
+                  description=f"command argument {arg}", required=True)
+        for i, arg in enumerate(cmd.args)
+    ]
+    description = (cmd.description or f"Run the “{cmd.name}” command.").rstrip(".") + ". "
+    description += f"Shell command declared by package {pkg.name}"
+    description += f", runs: {cmd.command}." if cmd.command else "."
+    return Tool(
+        name=_tool_name(pkg.name, [cmd.name], used),
+        title=cmd.name,
+        description=description,
+        package=pkg.name,
+        page_label="(shell command)",
+        page_path="",
+        section="commands",
+        params=params,
+    )
+
+
+def build_tools(packages: list[Package]) -> list[Tool]:
+    """Turn the package/page/control model into a flat list of callable tools."""
+    tools: list[Tool] = []
+    used: set[str] = set()
+    for pkg in packages:
+        for cmd in pkg.commands:
+            tools.append(_command_tool(pkg, cmd, used))
+        for page in pkg.pages:
+            covered: set[str] = set()   # labels a dialog tool already offers
+            for sub in page.subpages:
+                tools += _dialog_tools(pkg, page, sub, used, covered)
+            tools += _page_tools(pkg, page, used, covered)
+    return tools
+
+
+def render_tools(tools: list[Tool], title: str, out=sys.stdout) -> None:
+    print(f"{title} — {len(tools)} tool(s)", file=out)
+    package = None
+    for tool in tools:
+        if tool.package != package:
+            package = tool.package
+            print(f"\n=== {package} " + "=" * max(0, 70 - len(package)), file=out)
+        print(f"\n  {tool.name}" + ("   [destructive]" if tool.destructive else ""), file=out)
+        print(f"    title: {tool.title}", file=out)
+        for line in textwrap.wrap(tool.description, 92,
+                                  initial_indent="    ", subsequent_indent="      "):
+            print(line, file=out)
+        if not tool.params:
+            print("    inputs: (none)", file=out)
+            continue
+        print("    inputs:", file=out)
+        width = max(len(p.name) for p in tool.params)
+        for param in tool.params:
+            print("      " + param.render(width), file=out)
+
+
+def tools_to_json(tools: list[Tool]) -> str:
+    return json.dumps([t.to_json() for t in tools], indent=2)
+
+
+# ==========================================================================
 # Main
 # ==========================================================================
 
@@ -1425,8 +2738,9 @@ def main(argv: list[str] | None = None) -> int:
     global INSECURE
 
     parser = argparse.ArgumentParser(
-        description="List the capabilities (pages, commands, buttons and inputs) "
-                    "of a running Cockpit server.",
+        description="List the capabilities (pages, commands, buttons and inputs) of a "
+                    "running Cockpit server, as a tree or — with --tools — as the list "
+                    "of actions it offers, with their descriptions and input values.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="Environment: COCKPIT_HOST/PORT/USER/PASSWORD/TLS/TLS_INSECURE/CA/SUPERUSER/TIMEOUT")
     parser.add_argument("target", nargs="?", default=None,
@@ -1437,10 +2751,16 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--user", metavar="NAME", help="log in as this user")
     parser.add_argument("--no-controls", dest="controls", action="store_false",
                         help="list manifests only; skip the per-page button/input scan")
+    parser.add_argument("--tools", action="store_true",
+                        help="list the actions as tools — name, description and input "
+                             "values — instead of the capability tree")
     parser.add_argument("--insecure", action="store_true",
                         help="do not verify the server's TLS certificate")
     parser.add_argument("--json", action="store_true", help="emit JSON instead of a tree")
     args = parser.parse_args(argv)
+
+    if args.tools and not args.controls:
+        parser.error("--tools needs the per-page scan: drop --no-controls")
 
     set_target(args.target or os.environ.get("COCKPIT_HOST") or DEFAULT_TARGET)
     if args.insecure:
@@ -1454,6 +2774,17 @@ def main(argv: list[str] | None = None) -> int:
         introspect(packages, cookie)
 
     title = f"{SCHEME}://{HOST}:{PORT}"
+    if args.tools:
+        tools = build_tools(packages)
+        if args.json:
+            print(tools_to_json(tools))
+        else:
+            render_tools(tools, title)
+            print()
+        log(f"{summarise(packages)} → {len(tools)} tool(s), "
+            f"{sum(len(t.params) for t in tools)} input(s)")
+        return 0
+
     if args.json:
         print(to_json(packages))
     else:
