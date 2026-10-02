@@ -134,6 +134,34 @@ worth trusting: a dialog with two confirm buttons ("Create snapshot and mount"
 The same caveat applies, one level up: a tool here is an action the UI offers,
 not a verified API call.
 
+THE --live PASS
+===============
+Everything above is recovered from files the server serves, so it reads the
+same whatever the host is doing — and that is exactly what a page in a browser
+is not. The accounts page lists the accounts that exist, the services page the
+units that are loaded, storage the disks that are plugged in. A tool
+definition without that is a verb without objects: "Delete account" says
+nothing about which accounts there are to delete.
+
+--live adds that missing half. Each page a probe is written for (users,
+services, overview, networking, storage, SELinux) is read the same way the
+page reads itself — the channels of doc/protocol.md over the WebSocket this
+script already opens: "fsread1" where the page uses cockpit.file, "stream"
+with a spawn where it uses cockpit.spawn, "dbus-json3" where it uses
+cockpit.dbus. The result is summarised the way the page presents it (the login
+accounts, not all 40 lines of /etc/passwd) and attached to the page; every
+tool on that page then carries it, in its description and under "state" in
+--tools --json.
+
+The probes are read-only and unprivileged by construction: a file read, a
+D-Bus getter, or a command that only reports. Which probe belongs to which
+page is hardcoded rather than discovered. A bundle does name its own data
+sources — cockpit.file("/etc/passwd"), cockpit.dbus("org.freedesktop.login1")
+survive minification as string literals — but knowing that a page reads
+/etc/passwd is not knowing that field 1 is a login name, and "discovering" a
+cockpit.spawn() would mean running "usermod" to find out what it does. The
+summary is the value, so the summary is written by hand.
+
 DEPENDENCIES
 ============
 Python 3 stdlib only. No pip installs, and no local checkout of the source —
@@ -151,6 +179,8 @@ USAGE
     COCKPIT_PASSWORD=… ./cockpit_list_tools.py --tools         # tree of mock tools
     COCKPIT_PASSWORD=… ./cockpit_list_tools.py --tools --flat  # one tool at a time, in full
     COCKPIT_PASSWORD=… ./cockpit_list_tools.py --tools --json  # MCP tool definitions
+    COCKPIT_PASSWORD=… ./cockpit_list_tools.py --tools --live  # …with what the pages show
+    COCKPIT_PASSWORD=… ./cockpit_list_tools.py --live --no-controls   # live state only
 
     COCKPIT_CA=/path/ca.pem ./cockpit_list_tools.py https://myhost   # pin a CA
     ./cockpit_list_tools.py --insecure https://myhost                # skip verification
@@ -180,6 +210,7 @@ import string
 import struct
 import sys
 import textwrap
+import time
 from dataclasses import dataclass, field
 from typing import Any, BinaryIO, Iterator
 
@@ -481,6 +512,185 @@ def ws_connect(cookie: str) -> WebSocket:
     return WebSocket(sock, reader)
 
 
+# --------------------------------------------------------------------------
+# Channels: reading live state over the session WebSocket
+# --------------------------------------------------------------------------
+#
+# Everything above is static: it comes out of the files the server serves and
+# reads the same whatever the host is doing. What the *browser* shows is not —
+# the accounts page lists the accounts that exist, the services page the units
+# that are loaded — and that state is what says which objects an action can be
+# aimed at.
+#
+# A page gets that data by opening a channel on the bridge (doc/protocol.md):
+# "fsread1" for a file (cockpit.file), "stream" with a "spawn" for a command
+# (cockpit.spawn), "dbus-json3" for a D-Bus call (cockpit.dbus). We can open
+# exactly those channels on the socket we already authenticated, so the same
+# data is one "open" away.
+#
+# Channels are multiplexed over the one socket: a payload frame is
+# "<channel>\n<data>", a control frame "\n<json>". We use one channel at a
+# time and finish with it before opening the next, so the reader never has to
+# interleave two of them.
+
+PROBE_TIMEOUT = int(os.environ.get("COCKPIT_PROBE_TIMEOUT", "20"))
+MAX_READ = 1 << 20
+
+
+class Session:
+    """A live session on the bridge: opens channels and reads what they send.
+
+    Every method is read-only and best-effort — a probe that the host does not
+    answer (no such file, service not on the bus, command not installed) logs a
+    skip and returns None rather than failing the listing.
+    """
+
+    def __init__(self, ws: WebSocket) -> None:
+        self.ws = ws
+        self._seq = 0
+        self.calls = 0
+        self.failures = 0
+
+    def _next_channel(self) -> str:
+        self._seq += 1
+        return f"probe{self._seq}"
+
+    def _send_payload(self, channel: str, text: str) -> None:
+        self.ws.send_frame(OP_TEXT, f"{channel}\n{text}".encode())
+
+    def _close_channel(self, channel: str) -> None:
+        with contextlib.suppress(OSError):
+            self.ws.send_control({"command": "close", "channel": channel})
+
+    def _collect(self, channel: str, reply_id: str | None = None
+                 ) -> tuple[list[str], dict[str, Any]]:
+        """Read this channel's payload frames until it is done.
+
+        "Done" is the channel's own "close" for a file or a command; a D-Bus
+        channel stays open for signals, so a call is done when its reply
+        (matched by ``id``) comes back. Keepalives are answered on the way
+        past, and other channels' frames — there should be none — ignored.
+        """
+        deadline = time.monotonic() + PROBE_TIMEOUT
+        frames: list[str] = []
+        size = 0
+        while time.monotonic() < deadline:
+            try:
+                opcode, payload = self.ws.recv_frame()
+            except (OSError, ConnectionError, struct.error) as exc:
+                return frames, {"problem": f"{exc}"}
+            if opcode == OP_PING:
+                self.ws.send_frame(OP_PONG, payload)
+                continue
+            if opcode == OP_CLOSE:
+                return frames, {"problem": "disconnected"}
+            if opcode != OP_TEXT:
+                continue
+            head, _, body = payload.decode("utf-8", "replace").partition("\n")
+            if not head:                                    # a control message
+                msg = json.loads(body)
+                if msg.get("command") == "ping":
+                    self.ws.send_control({**msg, "command": "pong"})
+                elif msg.get("command") == "close" and msg.get("channel") == channel:
+                    return frames, msg
+                continue
+            if head != channel:
+                continue
+            frames.append(body)
+            size += len(body)
+            if size > MAX_READ:
+                return frames, {"problem": "too-large"}
+            if reply_id is not None:
+                with contextlib.suppress(ValueError):
+                    if json.loads(body).get("id") == reply_id:
+                        return frames, {}
+        return frames, {"problem": "timeout"}
+
+    def read_file(self, path: str) -> str | None:
+        """A file's contents, the way cockpit.file() reads it (fsread1)."""
+        channel = self._next_channel()
+        self.calls += 1
+        self.ws.send_control({"command": "open", "channel": channel, "payload": "fsread1",
+                              "path": path, "max_read_size": MAX_READ})
+        frames, close = self._collect(channel)
+        if close.get("problem"):
+            self.failures += 1
+            log(f"   (skip) read {path}: {close['problem']}")
+            return None
+        return "".join(frames)
+
+    def spawn(self, argv: list[str]) -> str | None:
+        """A command's standard output, the way cockpit.spawn() runs it.
+
+        Unprivileged on purpose: a probe that needed "superuser" would prompt
+        for a password or trip polkit, and nothing worth reading here does.
+        """
+        channel = self._next_channel()
+        self.calls += 1
+        self.ws.send_control({"command": "open", "channel": channel, "payload": "stream",
+                              "spawn": list(argv), "environ": ["LC_ALL=C"],
+                              "err": "message"})
+        frames, close = self._collect(channel)
+        if close.get("problem") or close.get("exit-status"):
+            self.failures += 1
+            log(f"   (skip) {argv[0]}: {close.get('problem') or close.get('message') or close}")
+            return None
+        return "".join(frames)
+
+    def dbus_call(self, service: str, path: str, interface: str, method: str,
+                  args: list[Any] | None = None, bus: str = "system") -> list[Any] | None:
+        """One D-Bus method call; returns its out arguments, or None."""
+        channel = self._next_channel()
+        self.calls += 1
+        self.ws.send_control({"command": "open", "channel": channel, "payload": "dbus-json3",
+                              "bus": bus, "name": service})
+        self._send_payload(channel, json.dumps(
+            {"call": [path, interface, method, list(args or [])], "id": "call"}))
+        frames, close = self._collect(channel, reply_id="call")
+        self._close_channel(channel)
+        for frame in frames:
+            try:
+                msg = json.loads(frame)
+            except ValueError:
+                continue
+            if msg.get("id") != "call":
+                continue
+            if "reply" in msg:
+                return msg["reply"][0] if msg["reply"] else []
+            if "error" in msg:
+                self.failures += 1
+                log(f"   (skip) {service}.{method}: {msg['error'][0]}")
+                return None
+        self.failures += 1
+        log(f"   (skip) {service}.{method}: {close.get('problem', 'no reply')}")
+        return None
+
+    def properties(self, service: str, path: str, interface: str,
+                   bus: str = "system") -> dict[str, Any] | None:
+        """org.freedesktop.DBus.Properties.GetAll, with the variants unwrapped."""
+        out = self.dbus_call(service, path, "org.freedesktop.DBus.Properties",
+                             "GetAll", [interface], bus)
+        if not out or not isinstance(out[0], dict):
+            return None
+        return {key: _variant(value) for key, value in out[0].items()}
+
+
+def _variant(value: Any) -> Any:
+    """dbus-json3 wraps a variant as {"t": signature, "v": value}."""
+    return value["v"] if isinstance(value, dict) and "v" in value else value
+
+
+def open_session(cookie: str) -> Session | None:
+    """Open an inited WebSocket session for the live probes, or None."""
+    try:
+        ws = ws_connect(cookie)
+        ws.init_session()
+        return Session(ws)
+    except (OSError, RuntimeError) as exc:
+        log(f"   (warning) no live session: {exc}")
+        return None
+
+
 def connect() -> tuple[str, dict[str, Any]]:
     """Log in to the server; return the session cookie and its manifests.json."""
     global MANIFEST_HOST
@@ -636,6 +846,41 @@ class Subpage:
 
 
 @dataclass
+class Resource:
+    """A live inventory the page works on: the accounts that exist, the units
+    that are loaded, the block devices that are present.
+
+    This is the part of a page that the static scan cannot see — it is read
+    from the host at listing time (see Session), and it is what says *which*
+    objects the page's actions can be aimed at.
+    """
+    name: str                        # "accounts"
+    title: str                       # "Accounts on the host"
+    items: list[str] = field(default_factory=list)
+    total: int = 0                   # how many there are, before truncation
+    note: str | None = None          # what the list leaves out, if anything
+    source: str = ""                 # the file, command or D-Bus call it came from
+
+    def line(self, limit: int | None = None) -> str:
+        """The inventory on one line: "Accounts (3): root, chris, admin"."""
+        items = self.items if limit is None else self.items[:limit]
+        out = f"{self.title} ({self.total})"
+        if items:
+            out += ": " + ", ".join(items)
+            if len(items) < self.total:
+                out += f", … (+{self.total - len(items)} more)"
+        if self.note:
+            out += f" — {self.note}" if not items else f"; {self.note}"
+        return out
+
+    def render(self) -> str:
+        out = self.line()
+        if self.source:
+            out += f"  [{self.source}]"
+        return out
+
+
+@dataclass
 class Page:
     """A manifest entry (menu/tools/dashboard, or a package-private section)."""
     section: str
@@ -647,6 +892,7 @@ class Page:
     scripts: list[str] = field(default_factory=list)   # bundles that were scanned
     controls: list[Control] = field(default_factory=list)
     subpages: list[Subpage] = field(default_factory=list)
+    resources: list[Resource] = field(default_factory=list)  # live state (--live)
 
     def render(self) -> str:
         return f"[{self.section}] {self.label}  →  {self.path}"
@@ -2130,6 +2376,275 @@ def introspect(packages: list[Package], cookie: str) -> None:
 
 
 # ==========================================================================
+# The live pass: what the page is currently showing
+# ==========================================================================
+#
+# A tool definition recovered from the bundle says what an action *is*
+# ("delete an account") but not what it can be aimed at. The browser shows
+# that part: the accounts page lists the accounts, the services page the
+# units, storage the block devices. Reading the same data turns a catalog of
+# verbs into a catalog of verbs with objects, which is most of the context a
+# caller is missing.
+#
+# Each probe below reads what one page reads, through the channel that page
+# uses, and summarises it the way the page presents it (the accounts page
+# lists the login accounts, not all 40 entries of /etc/passwd). They are
+# read-only and unprivileged throughout: a file read, a D-Bus getter, or a
+# command that only reports — never a "superuser" channel, never a mutation.
+#
+# Which page a probe belongs to is hardcoded, on purpose. The data sources a
+# bundle mentions *can* be recovered from it — cockpit.file("/etc/passwd")
+# and cockpit.dbus("org.freedesktop.login1") survive minification as string
+# literals — but knowing that a page reads /etc/passwd is not knowing that
+# field 1 is a login name and field 3 the uid, and running a cockpit.spawn()
+# found that way would mean running "usermod" to find out what it does. The
+# summary is the whole value here, so the summary is written out by hand.
+
+MAX_ITEMS = 24           # longest inventory we print in full
+DESC_ITEMS = 10          # …and in a tool description, which has to stay readable
+
+
+def _resource(name: str, title: str, items: list[str], source: str,
+              note: str | None = None) -> Resource:
+    return Resource(name=name, title=title, items=items[:MAX_ITEMS],
+                    total=len(items), note=note, source=source)
+
+
+def _probe_accounts(s: Session) -> list[Resource]:
+    """The accounts and groups the Accounts page lists (pkg/users/users.js)."""
+    out: list[Resource] = []
+    passwd = s.read_file("/etc/passwd")
+    if passwd is not None:
+        logins, system = [], 0
+        for line in passwd.splitlines():
+            parts = line.split(":")
+            if len(parts) < 7 or not parts[2].isdigit():
+                continue
+            name, uid, gecos, shell = parts[0], int(parts[2]), parts[4], parts[6]
+            # the page shows root plus the accounts inside [UID_MIN, UID_MAX];
+            # the defaults from login.defs are close enough to say which is which
+            if uid == 0 or 1000 <= uid < 65534:
+                real = gecos.split(",")[0].strip()
+                label = f"{name} (uid {uid}{', ' + real if real else ''})"
+                if re.search(r"/(nologin|false)$", shell):
+                    label += " [no login shell]"
+                logins.append(label)
+            else:
+                system += 1
+        out.append(_resource("accounts", "Accounts the page lists", logins,
+                             "fsread /etc/passwd",
+                             note=f"{system} further system account(s)" if system else None))
+    group = s.read_file("/etc/group")
+    if group is not None:
+        groups = []
+        for line in group.splitlines():
+            parts = line.split(":")
+            # the page's group list is bounded by GID_MIN/GID_MAX, whose
+            # defaults leave out both the system groups and "nobody"
+            if len(parts) < 4 or not parts[2].isdigit() or not 1000 <= int(parts[2]) <= 60000:
+                continue
+            members = [m for m in parts[3].split(",") if m]
+            groups.append(f"{parts[0]} (gid {parts[2]}" +
+                          (f", members: {' '.join(members)}" if members else "") + ")")
+        out.append(_resource("groups", "Non-system groups", groups, "fsread /etc/group"))
+    return out
+
+
+def _probe_units(s: Session) -> list[Resource]:
+    """The units the Services page lists (systemd1.Manager.ListUnits)."""
+    reply = s.dbus_call("org.freedesktop.systemd1", "/org/freedesktop/systemd1",
+                        "org.freedesktop.systemd1.Manager", "ListUnits")
+    units = reply[0] if reply and isinstance(reply[0], list) else []
+    if not units:
+        return []
+    # ListUnits rows are (name, description, load, active, sub, follow, path, …)
+    running = [f"{u[0]} ({u[4]})" for u in units
+               if u[0].endswith(".service") and u[3] == "active"]
+    failed = [f"{u[0]} — {u[1]}" for u in units if u[3] == "failed"]
+    timers = [u[0] for u in units if u[0].endswith(".timer") and u[3] == "active"]
+    sockets = sum(1 for u in units if u[0].endswith(".socket") and u[3] == "active")
+    out = [_resource("services", "Running services", running,
+                     "dbus systemd1 ListUnits",
+                     note=f"{sockets} active socket(s), {len(units)} unit(s) loaded")]
+    if failed:
+        out.append(_resource("failed_units", "Failed units", failed,
+                             "dbus systemd1 ListUnits"))
+    if timers:
+        out.append(_resource("timers", "Active timers", timers,
+                             "dbus systemd1 ListUnits"))
+    return out
+
+
+# NM's device states and types, as the Networking page names them
+# (NM_DEVICE_STATE / NM_DEVICE_TYPE in NetworkManager.h).
+NM_STATES = {0: "unknown", 10: "unmanaged", 20: "unavailable", 30: "disconnected",
+             40: "preparing", 50: "configuring", 60: "need auth", 70: "ip config",
+             80: "ip check", 90: "secondaries", 100: "connected",
+             110: "deactivating", 120: "failed"}
+NM_TYPES = {1: "ethernet", 2: "wifi", 5: "bluetooth", 10: "bond", 11: "vlan",
+            12: "adsl", 13: "bridge", 14: "generic", 15: "team", 16: "tun",
+            17: "ip tunnel", 22: "veth", 29: "wireguard", 30: "wifi-p2p", 32: "loopback"}
+
+
+def _probe_network(s: Session) -> list[Resource]:
+    """The interfaces and active connections the Networking page lists."""
+    reply = s.dbus_call("org.freedesktop.NetworkManager", "/org/freedesktop/NetworkManager",
+                        "org.freedesktop.NetworkManager", "GetDevices")
+    paths = reply[0] if reply and isinstance(reply[0], list) else []
+    devices = []
+    for path in paths[:MAX_ITEMS]:
+        props = s.properties("org.freedesktop.NetworkManager", path,
+                             "org.freedesktop.NetworkManager.Device")
+        if not props:
+            continue
+        name = props.get("Interface") or posixpath.basename(path)
+        kind = NM_TYPES.get(props.get("DeviceType"), str(props.get("DeviceType", "?")))
+        state = NM_STATES.get(props.get("State"), str(props.get("State", "?")))
+        devices.append(f"{name} ({kind}, {state})")
+    out = []
+    if devices:
+        out.append(_resource("interfaces", "Network interfaces", devices,
+                             "dbus NetworkManager GetDevices"))
+    reply = s.dbus_call("org.freedesktop.NetworkManager",
+                        "/org/freedesktop/NetworkManager/Settings",
+                        "org.freedesktop.NetworkManager.Settings", "ListConnections")
+    names = []
+    for path in (reply[0] if reply and isinstance(reply[0], list) else [])[:MAX_ITEMS]:
+        # a profile's name is not a D-Bus property of the connection object; it
+        # lives in the settings themselves, under connection.id
+        settings = s.dbus_call("org.freedesktop.NetworkManager", path,
+                               "org.freedesktop.NetworkManager.Settings.Connection",
+                               "GetSettings")
+        conn = (settings[0] if settings else {}).get("connection") or {}
+        name, kind = _variant(conn.get("id")), _variant(conn.get("type"))
+        if name:
+            names.append(f"{name}" + (f" ({kind})" if kind else ""))
+    if names:
+        out.append(_resource("connections", "Configured connection profiles", names,
+                             "dbus NetworkManager ListConnections"))
+    return out
+
+
+def _probe_storage(s: Session) -> list[Resource]:
+    """The block devices and mounts the Storage page works on."""
+    out: list[Resource] = []
+    text = s.spawn(["lsblk", "--json", "-o", "NAME,SIZE,TYPE,FSTYPE,MOUNTPOINT"])
+    if text:
+        with contextlib.suppress(ValueError, KeyError, TypeError):
+            devices = []
+
+            def walk(nodes: list[dict[str, Any]]) -> None:
+                for node in nodes:
+                    bits = [str(node[key]) for key in
+                            ("size", "type", "fstype", "mountpoint") if node.get(key)]
+                    devices.append(f"{node.get('name')}" +
+                                   (" (" + ", ".join(bits) + ")" if bits else ""))
+                    walk(node.get("children") or [])
+
+            walk(json.loads(text).get("blockdevices") or [])
+            out.append(_resource("block_devices", "Block devices", devices, "lsblk"))
+    mounts = s.read_file("/proc/self/mountinfo")
+    if mounts:
+        seen = []
+        for line in mounts.splitlines():
+            parts = line.split(" - ")
+            if len(parts) != 2:
+                continue
+            fields, tail = parts[0].split(), parts[1].split()
+            if len(fields) < 5 or len(tail) < 2:
+                continue
+            fstype, source = tail[0], tail[1]
+            if source.startswith("/dev/"):
+                seen.append(f"{fields[4]} ← {source} ({fstype})")
+        out.append(_resource("mounts", "Mounted filesystems", seen,
+                             "fsread /proc/self/mountinfo"))
+    return out
+
+
+def _probe_host(s: Session) -> list[Resource]:
+    """The facts the Overview page leads with (hostname1 + a uname)."""
+    props = s.properties("org.freedesktop.hostname1", "/org/freedesktop/hostname1",
+                         "org.freedesktop.hostname1") or {}
+    facts = [f"{caption}: {props[key]}" for key, caption in (
+        ("Hostname", "hostname"), ("StaticHostname", "static hostname"),
+        ("PrettyHostname", "pretty hostname"),
+        ("OperatingSystemPrettyName", "operating system"),
+        ("KernelRelease", "kernel"), ("Chassis", "chassis"),
+        ("HardwareVendor", "vendor"), ("HardwareModel", "model"),
+    ) if props.get(key)]
+    out = []
+    if facts:
+        out.append(_resource("host", "This host", facts, "dbus hostname1"))
+    uptime = s.read_file("/proc/uptime")
+    if uptime:
+        with contextlib.suppress(ValueError, IndexError):
+            seconds = int(float(uptime.split()[0]))
+            out.append(Resource(name="uptime", title="Uptime", total=1,
+                                items=[f"{seconds // 86400}d {seconds % 86400 // 3600}h "
+                                       f"{seconds % 3600 // 60}m"],
+                                source="fsread /proc/uptime"))
+    return out
+
+
+def _probe_selinux(s: Session) -> list[Resource]:
+    """The mode the SELinux page reports."""
+    mode = s.spawn(["getenforce"])
+    if not mode:
+        return []
+    return [Resource(name="selinux", title="SELinux mode", items=[mode.strip()],
+                     total=1, source="getenforce")]
+
+
+@dataclass
+class Probe:
+    """A live reader bound to the page whose data it reads.
+
+    ``page`` is the manifest path; empty means every page of the package.
+    """
+    package: str
+    page: str
+    run: Any            # Callable[[Session], list[Resource]]
+
+
+PROBES = [
+    Probe("users", "", _probe_accounts),
+    Probe("system", "services.html", _probe_units),
+    Probe("system", "index.html", _probe_host),
+    Probe("network", "", _probe_network),
+    Probe("storage", "", _probe_storage),
+    Probe("selinux", "", _probe_selinux),
+]
+
+
+def probe_live(packages: list[Package], cookie: str) -> None:
+    """Fill in page.resources for every page a probe knows how to read."""
+    wanted = [(pkg, page, probe)
+              for pkg in packages for page in pkg.pages for probe in PROBES
+              if probe.package == pkg.name and probe.page in ("", page.path)]
+    if not wanted:
+        log("no live probe matches the selected package(s)")
+        return
+    log(f"reading live state for {len(wanted)} page(s)")
+    session = open_session(cookie)
+    if session is None:
+        return
+    try:
+        for pkg, page, probe in wanted:
+            try:
+                resources = probe.run(session)
+            except (OSError, RuntimeError, ValueError) as exc:
+                log(f"   (skip) {pkg.name}/{page.path}: {exc}")
+                continue
+            page.resources += [r for r in resources if r.items]
+            log(f"   {pkg.name}/{page.path}: " + (", ".join(
+                f"{r.total} {r.name}" for r in page.resources) or "nothing read"))
+    finally:
+        with contextlib.suppress(OSError):
+            session.ws.close()
+    log(f"   {session.calls} channel(s), {session.failures} unanswered")
+
+
+# ==========================================================================
 # Output
 # ==========================================================================
 
@@ -2179,6 +2694,10 @@ def build_tree(packages: list[Package], title: str) -> Node:
                     node.add("keywords: " + ", ".join(sorted(set(page.keywords))))
                 if page.docs:
                     node.add("docs: " + ", ".join(page.docs))
+                if page.resources:
+                    lnode = node.add(f"live state ({len(page.resources)})")
+                    for resource in page.resources:
+                        lnode.add(resource.render())
                 if page.controls:
                     label = f"controls ({len(page.controls)})"
                     if page.scripts:
@@ -2208,7 +2727,12 @@ def summarise(packages: list[Package]) -> str:
     pages = sum(len(p.pages) for p in packages)
     commands = sum(len(p.commands) for p in packages)
     controls = sum(len(page.controls) for p in packages for page in p.pages)
-    return f"{len(packages)} package(s), {pages} page(s), {commands} command(s), {controls} control(s)"
+    out = (f"{len(packages)} package(s), {pages} page(s), {commands} command(s), "
+           f"{controls} control(s)")
+    live = sum(r.total for p in packages for page in p.pages for r in page.resources)
+    if live:
+        out += f", {live} live object(s)"
+    return out
 
 
 # ==========================================================================
@@ -2348,6 +2872,21 @@ class Tool:
     destructive: bool = False
     framework: str = ""             # the dialog idiom: markup / spec / state
     selectors: dict[str, str] = field(default_factory=dict)  # how to drive it
+    context: list[Resource] = field(default_factory=list)    # live state (--live)
+
+    def described(self) -> str:
+        """The description, with the live state of the page appended.
+
+        What the page currently holds is the part a caller cannot infer from
+        the action's name — "Delete account" means little without knowing
+        which accounts exist — so it goes into the description itself, where
+        an MCP client will actually read it, and not only into the metadata.
+        """
+        if not self.context:
+            return self.description
+        state = " ".join(f"{r.line(DESC_ITEMS)}." for r in self.context)
+        return (f"{self.description} Current state of this page, read from the "
+                f"host at listing time: {state}")
 
     def input_schema(self) -> dict[str, Any]:
         schema: dict[str, Any] = {
@@ -2365,10 +2904,11 @@ class Tool:
         return {
             "name": self.name,
             "title": self.title,
-            "description": self.description,
+            "description": self.described(),
             "inputSchema": self.input_schema(),
             "annotations": {"destructiveHint": self.destructive},
             "cockpit": {
+                "state": [dataclasses.asdict(r) for r in self.context] or None,
                 "package": self.package,
                 "section": self.section,
                 "page": self.page_label,
@@ -2708,9 +3248,13 @@ def build_tools(packages: list[Package]) -> list[Tool]:
             tools.append(_command_tool(pkg, cmd, used))
         for page in pkg.pages:
             covered: set[str] = set()   # labels a dialog tool already offers
+            owned: list[Tool] = []
             for sub in page.subpages:
-                tools += _dialog_tools(pkg, page, sub, used, covered)
-            tools += _page_tools(pkg, page, used, covered)
+                owned += _dialog_tools(pkg, page, sub, used, covered)
+            owned += _page_tools(pkg, page, used, covered)
+            for tool in owned:          # every action on a page acts on its state
+                tool.context = page.resources
+            tools += owned
     return tools
 
 
@@ -2723,7 +3267,7 @@ def render_tools(tools: list[Tool], title: str, out=sys.stdout) -> None:
             print(f"\n=== {package} " + "=" * max(0, 70 - len(package)), file=out)
         print(f"\n  {tool.name}" + ("   [destructive]" if tool.destructive else ""), file=out)
         print(f"    title: {tool.title}", file=out)
-        for line in textwrap.wrap(tool.description, 92,
+        for line in textwrap.wrap(tool.described(), 92,
                                   initial_indent="    ", subsequent_indent="      "):
             print(line, file=out)
         if not tool.params:
@@ -2819,6 +3363,10 @@ def build_tools_tree(tools: list[Tool], title: str) -> Node:
             if path:
                 head += f"  →  {path}"
             gnode = pnode.add(f"{head}   {len(owned)} tool(s)")
+            # the live state belongs to the page, and every tool on it carries
+            # the same copy — print it once here rather than under each tool
+            for resource in owned[0].context if owned else []:
+                gnode.add("state · " + _clip(resource.line(), 110))
             for tool in owned:
                 gnode.children.append(_tool_node(tool))
     return root
@@ -2851,6 +3399,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--flat", action="store_true",
                         help="with --tools: the detailed one-tool-at-a-time listing "
                              "instead of the tree")
+    parser.add_argument("--live", action="store_true",
+                        help="also read what each page currently shows (accounts, units, "
+                             "interfaces, disks) and attach it to the pages and tools")
     parser.add_argument("--insecure", action="store_true",
                         help="do not verify the server's TLS certificate")
     parser.add_argument("--json", action="store_true", help="emit JSON instead of a tree")
@@ -2871,6 +3422,8 @@ def main(argv: list[str] | None = None) -> int:
     packages = build_packages(manifests, args.package)
     if args.controls:
         introspect(packages, cookie)
+    if args.live:
+        probe_live(packages, cookie)
 
     title = f"{SCHEME}://{HOST}:{PORT}"
     if args.tools:
