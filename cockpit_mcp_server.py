@@ -28,21 +28,35 @@ accounts there are, and `cockpit_search_tools("delete account")` says both.
 
 INVOKING IS REAL
 ================
-Cockpit's UI *is* its API: a page is a React bundle talking to the bridge over
-its own WebSocket, so there is no endpoint behind "Create account" to call
-instead. cockpit_invoke therefore drives a headless Chromium
-(cockpit_browser.py): it logs in, opens the page, presses the button that
-opens the dialog, fills the fields from ``arguments`` and presses the one that
-confirms it. What the action does to the host, it really does.
+Cockpit's UI *is* its API: a page is a React bundle talking to cockpit-bridge
+over its own WebSocket, so there is no endpoint behind "Create account" to
+call instead. cockpit_invoke performs an action one of two ways, and either
+way what the action does to the host, it really does:
 
-Two gates sit in front of that:
+  * **the bridge** (cockpit_bridge.py) for the actions whose call is known —
+    the same ``cockpit.spawn(["/usr/sbin/userdel", "-r", name], {superuser:
+    "require"})`` the dialog's own button makes, sent on the same protocol the
+    page uses. No browser, about a tenth of a second. The recipes are
+    hand-written from the page sources, because a bundle says which button
+    exists but not what it does;
+  * **a headless Chromium** (cockpit_browser.py) for everything else: log in,
+    open the page, press the button that opens the dialog, fill the fields
+    from ``arguments``, press the one that confirms it.
+
+``backend`` chooses; by default an action with a bridge recipe uses it and the
+rest use the browser, so a host with no chromium installed can still perform
+everything in cockpit_bridge.ADAPTERS (``--no-browser`` makes that explicit,
+``--no-bridge`` sends everything through the UI).
+
+Two gates sit in front of both:
 
   * an action the catalog marks destructive needs ``confirm=true`` — without
     it the call returns the plan it would have run and changes nothing;
-  * ``dry_run=true`` walks the whole path — navigate, open the dialog, fill
-    every field — then presses Cancel instead of the confirming button. It is
-    the way to check that a tool's recovered selectors still fit the UI
-    without touching the host.
+  * ``dry_run=true`` performs nothing: in the browser it walks the whole path
+    — navigate, open the dialog, fill every field — and presses Cancel
+    instead of the confirming button, which is the way to check that a tool's
+    recovered selectors still fit the UI; over the bridge it reports the
+    exact calls it would make.
 
 ``--read-only`` turns every invocation into a dry run.
 
@@ -76,6 +90,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
+import cockpit_bridge as cbg
 import cockpit_browser as cbr
 import cockpit_list_tools as clt
 from mcp.server.mcpserver import MCPServer
@@ -99,6 +114,8 @@ class Config:
     headless: bool = True
     read_only: bool = False
     screenshot_dir: str | None = None
+    use_bridge: bool = True             # perform what can be performed directly
+    use_browser: bool = True            # … and drive the UI for the rest
 
     def apply(self) -> None:
         """Point cockpit_list_tools' module-level connection settings at us."""
@@ -315,6 +332,12 @@ def _full(tool: clt.Tool) -> dict[str, Any]:
     out["destructive"] = tool.destructive
     out["needs_confirm"] = needs_confirm(tool)
     out["plan"] = [step.as_json() for step in plan_steps(tool, {}, dry_run=False)]
+    adapter = cbg.adapter_for(tool.name) if CONFIG.use_bridge else None
+    out["backend"] = "bridge" if adapter else "browser"
+    if adapter:
+        # The plan above is the UI path, which backend="browser" still takes;
+        # this is what the action actually runs by default.
+        out["bridge_call"] = adapter.summary
     return out
 
 
@@ -480,11 +503,15 @@ def _drop_browser() -> None:
 
 def run_steps(tool: clt.Tool, steps: list[cbr.Step]) -> dict[str, Any]:
     """Perform the steps in the browser. Blocking; called in a worker thread."""
-    browser = _browser()
-    result: dict[str, Any] = {"performed": False, "access": browser.superuser}
+    result: dict[str, Any] = {"performed": False, "backend": "browser"}
     dialog = (tool.selectors or {}).get("dialog")
 
     try:
+        # Inside the try: on a machine with no chromium this is where the
+        # whole path fails, and the caller is owed the reason rather than an
+        # exception out of the tool call.
+        browser = _browser()
+        result["access"] = browser.superuser
         for step in steps:
             if step.status == "skipped":
                 continue
@@ -589,16 +616,20 @@ Work in this order:
      catalog is large, so search it rather than listing it.
   3. cockpit_describe_tool(name) — its inputs, with the current state of its
      page so you know which objects it can be aimed at.
-  4. cockpit_invoke(name, arguments) — perform it. This drives the real UI in
-     a browser and really changes the host. Pass dry_run=true first to check
-     the path without performing the action; an action that deletes, disables
-     or restarts something additionally requires confirm=true.
+  4. cockpit_invoke(name, arguments) — perform it. This really changes the
+     host: the action is either sent straight to cockpit-bridge, exactly as
+     the page's own button would send it, or performed by driving the real UI
+     in a browser — cockpit_describe_tool says which, as backend. Pass
+     dry_run=true first to see what it would do; an action that deletes,
+     disables or restarts something additionally requires confirm=true.
 
 An action that belongs to one of the objects a page lists — this account,
-that interface — needs to be told which one: pass at="mcptest", the name the
-page uses in its own URL. If a dialog then refuses to proceed, the result
-lists the fields it is showing as dialog_fields; anything there that the
-schema does not cover can be passed through extra, keyed by its caption.
+that unit, that interface — needs to be told which one: pass at="mcptest",
+the name the page uses in its own URL. Inputs the catalog does not name go in
+extra, keyed by the caption the dialog puts next to them: that is where the
+password for a new account goes, and the shell, group name or similar that an
+action whose backend is the bridge asks for. If a dialog refuses to proceed,
+the result lists the fields it is showing as dialog_fields.
 
 Every answer carries the state of the page it concerns. That state is read
 from the host, but it is a snapshot — call cockpit_refresh() after an action
@@ -753,39 +784,49 @@ async def cockpit_describe_tool(name: str) -> dict[str, Any]:
 
 @mcp.tool(
     title="Perform a Cockpit action",
-    description="Perform an action from the catalog by driving this host's Cockpit "
-                "UI in a browser: open the page, open its dialog, fill the inputs, "
-                "press the button. THIS REALLY CHANGES THE HOST. Pass dry_run=true "
-                "to walk the whole path and press Cancel instead (nothing is "
-                "changed). An action that deletes, disables, restarts or otherwise "
-                "disrupts something is refused unless confirm=true is passed with "
-                "it — cockpit_describe_tool says which ones those are. If the "
-                "dialog turns out to want a field the catalog never recovered, "
-                "the result lists what it is showing as dialog_fields; pass those "
-                "through `extra`, keyed by the caption the dialog puts next to them.",
+    description="Perform an action from the catalog. THIS REALLY CHANGES THE HOST. "
+                "An action whose call is known is sent straight to cockpit-bridge, "
+                "exactly as its dialog would send it (cockpit_describe_tool reports "
+                "backend=bridge and the call); every other action is performed by "
+                "driving this host's Cockpit UI in a browser — open the page, open "
+                "its dialog, fill the inputs, press the button. Pass dry_run=true to "
+                "see what would be done without doing it. An action that deletes, "
+                "disables, restarts or otherwise disrupts something is refused "
+                "unless confirm=true is passed with it. If a dialog turns out to "
+                "want a field the catalog never recovered, the result lists what it "
+                "is showing as dialog_fields; pass those through `extra`, keyed by "
+                "the caption the dialog puts next to them — which is also how the "
+                "bridge is told a password, a shell or a new name.",
 )
 async def cockpit_invoke(name: str, arguments: dict[str, Any] | None = None,
                          dry_run: bool = False, confirm: bool = False,
                          extra: dict[str, Any] | None = None,
                          at: str | None = None,
-                         open_with: str | None = None) -> dict[str, Any]:
+                         open_with: str | None = None,
+                         backend: str = "auto") -> dict[str, Any]:
     """
     Args:
         name: the action to perform, as returned by cockpit_search_tools.
         arguments: its inputs, as described by cockpit_describe_tool.
-        dry_run: do everything except the confirming click, then cancel.
+        dry_run: report what would be done without doing it — over the bridge
+            the exact calls, in the browser the whole path up to Cancel.
         confirm: required for destructive actions; ignored for the others.
-        extra: further dialog fields, keyed by their visible label rather than
-            by a schema name — for inputs the scan did not recover, such as the
+        extra: further inputs, keyed by their visible label rather than by a
+            schema name — for the fields the scan did not recover, such as the
             passwords the create-account dialog insists on.
         at: which of the objects the page lists to act on, named the way the
-            page addresses it in its hash — "mcptest" for an account, "ens4"
-            for an interface. Required whenever the action belongs to one
-            object rather than to the page; without it the action is performed
-            on whichever object the page happens to be showing.
+            page addresses it in its hash — "mcptest" for an account,
+            "sshd.service" for a unit, "ens4" for an interface. Required
+            whenever the action belongs to one object rather than to the page;
+            in the browser, without it the action is performed on whichever
+            object the page happens to be showing.
         open_with: the selector of the control that opens this action's dialog,
             for the actions whose opener the scan could not recover. The plan
-            in cockpit_describe_tool says when it is guessing one.
+            in cockpit_describe_tool says when it is guessing one. Browser only.
+        backend: "auto" (the default: the bridge where there is a recipe for
+            the action, the browser otherwise), "bridge" (fail rather than
+            fall back — no browser is started), or "browser" (drive the real
+            UI, which is the way to check that an action's selectors still fit).
     """
     cat = await catalog()
     tool = cat.by_name.get(name)
@@ -799,37 +840,92 @@ async def cockpit_invoke(name: str, arguments: dict[str, Any] | None = None,
         return {"error": "the arguments do not fit this action", "problems": problems,
                 "inputSchema": tool.input_schema()}
 
+    if backend not in ("auto", "bridge", "browser"):
+        return {"error": f"backend must be auto, bridge or browser, not {backend!r}"}
+
+    notes: list[str] = []
     if CONFIG.read_only and not dry_run:
         dry_run = True
-        note = "the server runs with --read-only, so this was a dry run"
+        notes.append("the server runs with --read-only, so this was a dry run")
+
+    # Which of the two performs it. An adapter that cannot build its calls
+    # from what was passed (no `at`, no password) is not an error: the browser
+    # needs no recipe, because it presses the real button.
+    calls: list[cbg.Call] | None = None
+    why_browser = ""                      # why this is not going over the bridge
+    adapter = cbg.adapter_for(name)
+    if backend == "browser":
+        why_browser = 'backend="browser" was asked for'
+    elif not CONFIG.use_bridge:
+        why_browser = "this server runs with --no-bridge"
+    elif adapter is None:
+        why_browser = f"there is no bridge recipe for {name}"
+        if backend == "bridge":
+            return {"error": f"{why_browser}; it can only be performed in the "
+                             f"browser (backend=\"browser\")", "performed": False}
     else:
-        note = None
+        try:
+            calls = cbg.plan(name, arguments, extra, at)
+        except cbg.Unsupported as exc:
+            why_browser = f"the bridge has a recipe for {name} but could not use it ({exc})"
+            if backend == "bridge":
+                return {"error": str(exc), "performed": False,
+                        "bridge_call": adapter.summary}
+            notes.append(f"{why_browser}, so this went to the browser")
 
     if needs_confirm(tool) and not confirm and not dry_run:
+        plan = ([c.as_json() for c in calls] if calls else
+                [s.as_json() for s in plan_steps(tool, arguments, False, extra, at, open_with)])
         return {
             "error": f"{name} changes or destroys something and needs confirm=true",
             "would_do": tool.title,
+            "backend": "bridge" if calls else "browser",
             "state": _state(tool.context),
-            "plan": [s.as_json() for s in plan_steps(tool, arguments, False, extra, at, open_with)],
+            "plan": plan,
             "performed": False,
         }
 
-    steps = plan_steps(tool, arguments, dry_run, extra, at, open_with)
     async with _DRIVE_LOCK:
-        result = await asyncio.to_thread(run_steps, tool, steps)
+        result: dict[str, Any] | None = None
+        if calls is not None:
+            try:
+                result = await asyncio.to_thread(cbg.BRIDGE.perform, calls, dry_run)
+            except cbg.BridgeError as exc:
+                # Raised while opening the session or asking for root, which
+                # is before any of the calls ran — so falling back performs
+                # the action once, not twice.
+                if backend == "bridge" or not CONFIG.use_browser:
+                    result = {"performed": False, "backend": "bridge", "error": str(exc)}
+                else:
+                    why_browser = f"the bridge was not available ({exc})"
+                    notes.append(f"{why_browser}, so this went to the browser")
+                    calls = None
+        if result is None:
+            if not CONFIG.use_browser:
+                refused: dict[str, Any] = {
+                    "error": f"this server runs with --no-browser, and {why_browser}",
+                    "performed": False}
+                if adapter is not None:
+                    refused["bridge_call"] = adapter.summary
+                return refused
+            steps = plan_steps(tool, arguments, dry_run, extra, at, open_with)
+            result = await asyncio.to_thread(run_steps, tool, steps)
         # the action changed the host; the state everything else reports must
         # not keep describing the host as it was before it
         if result.get("performed") and not dry_run:
             await asyncio.to_thread(CATALOG.refresh_live)
 
+    carried = result.pop("note", None)          # what the backend itself said
+    if carried:
+        notes.insert(0, carried)
     result.update({"tool": name, "title": tool.title, "dry_run": dry_run,
                    "arguments": arguments, "state_after": _state(tool.context)})
     if extra:
         result["extra"] = {k: "…" if _SECRET_RE.search(k) else v for k, v in extra.items()}
     if at:
         result["at"] = at
-    if note:
-        result["note"] = note
+    if notes:
+        result["note"] = " · ".join(notes)
     return result
 
 
@@ -932,6 +1028,12 @@ def main(argv: list[str] | None = None) -> int:
                         help="never perform an action: every invocation is a dry run")
     parser.add_argument("--browser", metavar="PATH",
                         help="the chromium binary to drive (default: the first one found)")
+    parser.add_argument("--no-bridge", action="store_true",
+                        help="never perform an action over the bridge: drive the UI "
+                             "for all of them")
+    parser.add_argument("--no-browser", action="store_true",
+                        help="never start a browser: only the actions cockpit_bridge "
+                             "has a recipe for can be performed")
     parser.add_argument("--headful", action="store_true",
                         help="show the browser window instead of running it headless")
     parser.add_argument("--screenshot-dir", metavar="DIR",
@@ -960,6 +1062,11 @@ def main(argv: list[str] | None = None) -> int:
     CONFIG.headless = not args.headful
     CONFIG.read_only = args.read_only
     CONFIG.screenshot_dir = args.screenshot_dir
+    CONFIG.use_bridge = not args.no_bridge
+    CONFIG.use_browser = not args.no_browser
+    if args.no_bridge and args.no_browser:
+        parser.error("--no-bridge and --no-browser together leave nothing that "
+                     "can perform an action; --read-only is what you want")
     CONFIG.apply()
 
     if args.prefetch:
@@ -973,6 +1080,7 @@ def main(argv: list[str] | None = None) -> int:
             mcp.run(args.transport, port=args.port)        # type: ignore[arg-type]
     finally:
         _drop_browser()
+        cbg.BRIDGE.close()
     return 0
 
 
@@ -981,4 +1089,5 @@ if __name__ == "__main__":
         raise SystemExit(main())
     except KeyboardInterrupt:
         _drop_browser()
+        cbg.BRIDGE.close()
         raise SystemExit(130) from None
