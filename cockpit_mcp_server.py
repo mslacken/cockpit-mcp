@@ -93,7 +93,7 @@ from typing import Any
 import cockpit_bridge as cbg
 import cockpit_browser as cbr
 import cockpit_list_tools as clt
-from mcp.server.mcpserver import MCPServer
+from mcp.server.fastmcp import FastMCP
 
 SERVER_NAME = "cockpit"
 LIVE_TTL = float(os.environ.get("COCKPIT_MCP_LIVE_TTL", "60"))   # seconds
@@ -153,6 +153,72 @@ def _route(package: str, path: str) -> str:
     return f"/{package}/{page}"
 
 
+# --------------------------------------------------------------------------
+# Actions the scan cannot see at all
+# --------------------------------------------------------------------------
+#
+# The overview's "Cancel reboot" link is in the bundle like any other button,
+# but it never becomes an action: shutdownStatus.tsx builds its caption in a
+# variable (it reads "Cancel poweroff" for the other kind), so the heuristic
+# that names an action after its caption labels this one from the nearest
+# string it can find — "still running", off the neighbouring card — and drops
+# it for not being an action verb.
+#
+# It has to be reachable all the same. cockpit_invoke("system_reboot")
+# schedules a reboot a minute out, as the dialog does, and that minute is
+# only a margin for error if calling it off is one call away.
+
+@dataclass
+class Missed:
+    """An action a human found on a page and the scan did not."""
+    name: str
+    title: str
+    description: str
+    package: str
+    page_path: str
+    control_id: str
+    destructive: bool = False
+
+
+MISSED = [
+    Missed(name="system_cancel_reboot",
+           title="Cancel reboot",
+           description="Call off a reboot or power off that is scheduled and "
+                       "has not happened yet, which is what the overview's "
+                       "\"Cancel reboot\" link does. Rebooting through Cockpit "
+                       "schedules it a minute out unless a delay says "
+                       "otherwise, so this is how a reboot is taken back.",
+           package="system", page_path="index.html",
+           control_id="system-health-shutdown-status-cancel-btn"),
+]
+
+
+def missed_tools(packages: list[clt.Package]) -> list[clt.Tool]:
+    """The hand-written actions, bound to the pages they live on.
+
+    Only the ones whose page this host actually has. ``context`` is the
+    page's own live-state list — the very object build_tools() hands its own
+    tools — so these describe the host as freshly as everything else does.
+    """
+    out: list[clt.Tool] = []
+    for missed in MISSED:
+        for pkg in packages:
+            if pkg.name != missed.package:
+                continue
+            for page in pkg.pages:
+                if page.path != missed.page_path:
+                    continue
+                out.append(clt.Tool(
+                    name=missed.name, title=missed.title,
+                    description=missed.description, package=pkg.name,
+                    page_label=page.label, page_path=page.path,
+                    section=page.section, control_id=missed.control_id,
+                    destructive=missed.destructive,
+                    selectors={"control": f"#{missed.control_id}"},
+                    context=page.resources))
+    return out
+
+
 @dataclass
 class Catalog:
     """The scan of one host: its packages, pages, live state and actions."""
@@ -182,7 +248,7 @@ class Catalog:
             with contextlib.suppress(OSError, RuntimeError):
                 cookie, _ = clt.connect()
                 clt.probe_live(packages, cookie)
-        tools = clt.build_tools(packages)
+        tools = clt.build_tools(packages) + missed_tools(packages)
 
         self.cookie = cookie
         self.packages = packages
@@ -303,10 +369,19 @@ _RISKY_RE = re.compile(
 _SECRET_RE = re.compile(r"pass|secret|key|token|pin\b|confirm", re.I)
 
 
+# … and the other way round, for the actions whose wording only matches
+# because of the thing they undo. "Cancel reboot" reads as a reboot to the
+# regex above, and a confirmation round trip is the last thing it needs:
+# whoever calls it has a minute before the host goes down.
+_UNDOES_RE = re.compile(r"\bcancel\w*\s+(a\s+)?(reboot|restart|shutdown|"
+                        r"poweroff|power off|scheduled)", re.I)
+
+
 def needs_confirm(tool: clt.Tool) -> bool:
-    return bool(tool.destructive or
-                _RISKY_RE.search(f"{tool.name.replace('_', ' ')} {tool.title} "
-                                 f"{tool.action or ''}"))
+    wording = f"{tool.name.replace('_', ' ')} {tool.title} {tool.action or ''}"
+    if _UNDOES_RE.search(wording):
+        return False
+    return bool(tool.destructive or _RISKY_RE.search(wording))
 
 
 def _brief(tool: clt.Tool) -> dict[str, Any]:
@@ -338,6 +413,11 @@ def _full(tool: clt.Tool) -> dict[str, Any]:
         # The plan above is the UI path, which backend="browser" still takes;
         # this is what the action actually runs by default.
         out["bridge_call"] = adapter.summary
+    fix = UI_FIXUPS.get(tool.name)
+    if fix:
+        # The scan read this button wrong; say so, because the description and
+        # the control it names come from the scan and still read as fact.
+        out["ui_note"] = fix.why
     return out
 
 
@@ -356,11 +436,141 @@ def _caption_selector(dialog: str, caption: str) -> str:
     return f'{dialog} button:contains("{caption}")'
 
 
+# --------------------------------------------------------------------------
+# Where the scan reads the page wrong, and a human has read it right
+# --------------------------------------------------------------------------
+#
+# The scan recovers a control and, when the bundle shows one, the dialog it
+# opens. Both halves can be wrong about the same button: the overview's
+# "Reboot" is an <id="reboot"> item of a dropdown that is not in the DOM until
+# its toggle is pressed, and pressing it does not reboot anything — it opens
+# #shutdown-dialog, whose danger button does. The catalog therefore lists
+# system_reboot as a page-level action on #reboot, and invoking it waits 20
+# seconds for a control that is not there.
+#
+# Nothing in the bundle says otherwise (the onClick is
+# ``Dialogs.show(<ShutdownModal />)``, which is exactly the React indirection
+# the scan cannot follow), so this is the browser's equivalent of
+# cockpit_bridge.ADAPTERS: hand-written entries, each transcribed from the
+# page source and from the selectors Cockpit's own test for it uses.
+
+@dataclass
+class Fixup:
+    """What the page really does, for an action the scan read wrong."""
+    open: list[str] = field(default_factory=list)   # clicks that open the dialog
+    dialog: str = ""
+    confirm: str = ""
+    action: str = ""                                # what that button is captioned
+    why: str = ""
+    # Fills the dialog's own fields. It replaces the generic `extra` handling,
+    # because these fields are not labelled inputs the browser can find by
+    # caption — the Delay is a PatternFly menu, which is two clicks.
+    fill: Any = None                                # (cbg.Request) -> [Step]
+    # True when performing this leaves no page behind to confirm it with.
+    ends_session: Any = None                        # (cbg.Request) -> bool
+
+
+# The Delay select offers these and nothing else (cockpit-components-shutdown
+# .jsx render()); anything else is a job for the bridge, which passes the
+# delay straight to shutdown(1).
+_DELAY_OPTIONS = {"+0": "No delay", "+1": "1 minute", "+5": "5 minutes",
+                  "+20": "20 minutes", "+40": "40 minutes", "+60": "60 minutes"}
+
+
+def _fill_shutdown_dialog(req: cbg.Request) -> list[cbr.Step]:
+    """#shutdown-dialog's two fields, pressed as check-system-shutdown-restart
+    presses them: #message is a textarea, Delay is a menu toggle plus an item.
+    """
+    steps: list[cbr.Step] = []
+    message = req.value("message", "wall", "message_to_logged_in_users")
+    if message:
+        steps.append(cbr.Step("set", selector="#message", value=str(message),
+                              detail="the message logged-in users are warned with"))
+    if req.value("delay", "when", "minutes", "time") is None:
+        return steps                        # leave the dialog's own 1 minute
+    option = _DELAY_OPTIONS.get(cbg.when(req)[0])
+    if option is None:
+        steps.append(cbr.Step("set", value=req.value("delay", "when"), status="skipped",
+                              detail="the dialog's Delay menu only offers " +
+                                     ", ".join(_DELAY_OPTIONS.values()) +
+                                     "; backend=\"bridge\" takes any delay"))
+        return steps
+    steps.append(cbr.Step("click", selector="#delay", detail="open the Delay menu"))
+    steps.append(cbr.Step("click", selector=f'button:contains("{option}")',
+                          detail=f"choose {option}"))
+    return steps
+
+
+def _immediately(req: cbg.Request) -> bool:
+    try:
+        return cbg.when(req)[1]
+    except cbg.Unsupported:
+        return False
+
+
+def ends_session(name: str, arguments: dict[str, Any], extra: dict[str, Any],
+                 at: str | None) -> bool:
+    """Whether performing this leaves no host behind to ask about it.
+
+    Both backends need the same answer, and neither can be trusted to notice
+    on its own: the browser's dialog closes normally on its way down, and the
+    bridge's "shutdown --reboot +0" usually answers before logind kills the
+    session. What settles it is the delay that was asked for.
+    """
+    fix = UI_FIXUPS.get(name)
+    if not (fix and fix.ends_session):
+        return False
+    return bool(fix.ends_session(cbg.Request(dict(arguments), dict(extra), at)))
+
+
+_SHUTDOWN_DIALOG = {
+    "dialog": "#shutdown-dialog",
+    # The footer's danger button, which is how Cockpit's own test addresses it
+    # — the caption differs between Reboot and Shut down, the styling does not.
+    "confirm": "#shutdown-dialog button.pf-m-danger",
+    "fill": _fill_shutdown_dialog,
+    "ends_session": _immediately,
+}
+
+UI_FIXUPS: dict[str, Fixup] = {
+    "system_reboot": Fixup(
+        # the split button, which is always there when the session is
+        # privileged — #reboot, which the scan found, is the same action
+        # hidden inside the menu that #shutdown-group opens
+        open=["#reboot-button"],
+        action="Reboot",
+        why="#reboot is a menu item that only exists while the shutdown menu "
+            "is open, and it opens #shutdown-dialog rather than rebooting; the "
+            "split button #reboot-button opens the same dialog directly",
+        **_SHUTDOWN_DIALOG),
+    "system_shutdown": Fixup(
+        open=["#shutdown-group", "#shutdown"],
+        action="Shut down",
+        why="#shutdown is an item of the menu that #shutdown-group opens, and "
+            "it opens #shutdown-dialog rather than powering the host off",
+        **_SHUTDOWN_DIALOG),
+    "system_shut_down": Fixup(
+        open=["#shutdown-group", "#shutdown"],
+        action="Shut down",
+        why="\"Shut down\" is #shutdown-dialog's own confirming button; the "
+            "menu item that opens that dialog is #shutdown",
+        **_SHUTDOWN_DIALOG),
+}
+
+
 def plan_steps(tool: clt.Tool, arguments: dict[str, Any], dry_run: bool,
                extra: dict[str, Any] | None = None, at: str | None = None,
                open_with: str | None = None) -> list[cbr.Step]:
     """The steps that perform ``tool`` with ``arguments``."""
-    sel = tool.selectors or {}
+    fix = UI_FIXUPS.get(tool.name)
+    req = cbg.Request(dict(arguments), dict(extra or {}), at)
+    sel = dict(tool.selectors or {})
+    action = tool.action
+    if fix:
+        sel["dialog"] = fix.dialog or sel.get("dialog")
+        action = fix.action or action
+        if fix.confirm:
+            sel["apply"] = fix.confirm
     route = _route(tool.package, tool.page_path)
     # An action on one of the objects a page lists lives on that object's own
     # view, which Cockpit addresses by hash: /users#/chris, /network#/ens4.
@@ -373,6 +583,9 @@ def plan_steps(tool: clt.Tool, arguments: dict[str, Any], dry_run: bool,
     if open_with:
         steps.append(cbr.Step("click", selector=open_with,
                               detail="opens the dialog (named by the caller)"))
+    elif fix and fix.open:
+        steps += [cbr.Step("click", selector=selector, detail=fix.why)
+                  for selector in fix.open]
     elif sel.get("open"):
         steps.append(cbr.Step("click", selector=sel["open"], detail="opens the dialog"))
     elif tool.opens_via and dialog:
@@ -403,25 +616,37 @@ def plan_steps(tool: clt.Tool, arguments: dict[str, Any], dry_run: bool,
         steps.append(cbr.Step("set", selector=selector, value=arguments[param.name],
                               detail=param.kind or None))
 
-    # Fields the scan never recovered. The create-account dialog's two
-    # password boxes are the standing example: they are built by a shared
-    # React component, so no selector for them survives into the bundle's
-    # page code, and without them the dialog's Create button never enables.
-    for label, value in (extra or {}).items():
-        steps.append(cbr.Step("set-label", selector=label, value=value,
-                              detail="a field the catalog did not name"))
+    if fix and fix.fill:
+        # This dialog's fields are written out by hand, so `extra` is read by
+        # the fixup rather than guessed at by caption.
+        steps += fix.fill(req)
+    else:
+        # Fields the scan never recovered. The create-account dialog's two
+        # password boxes are the standing example: they are built by a shared
+        # React component, so no selector for them survives into the bundle's
+        # page code, and without them the dialog's Create button never enables.
+        for label, value in (extra or {}).items():
+            steps.append(cbr.Step("set-label", selector=label, value=value,
+                                  detail="a field the catalog did not name"))
 
     if dialog:
-        confirm = sel.get("apply") or _caption_selector(dialog, tool.action or "Apply")
+        confirm = sel.get("apply") or _caption_selector(dialog, action or "Apply")
         cancel = sel.get("cancel") or _caption_selector(dialog, "Cancel")
         if dry_run:
             steps.append(cbr.Step("cancel", selector=cancel,
                                   detail="dry run: the action is abandoned here"))
         else:
             steps.append(cbr.Step("confirm", selector=confirm,
-                                  detail=f"confirms the action ({tool.action or 'apply'})"))
-            steps.append(cbr.Step("wait-gone", selector=dialog,
-                                  detail="the dialog closes when the action succeeded"))
+                                  detail=f"confirms the action ({action or 'apply'})"))
+            gone = cbr.Step("wait-gone", selector=dialog,
+                            detail="the dialog closes when the action succeeded")
+            if fix and fix.ends_session and fix.ends_session(req):
+                # The dialog closes when the spawn resolves — but the host is
+                # on its way down, and a page that dies first never gets to
+                # close it. Either way the action happened.
+                gone.tolerate = ("the page stopped answering, which is what "
+                                 "this action does to it")
+            steps.append(gone)
     else:
         # a page-level action: the control *is* the action
         control = sel.get("control") or (f"#{tool.control_id}" if tool.control_id else None)
@@ -539,6 +764,11 @@ def run_steps(tool: clt.Tool, steps: list[cbr.Step]) -> dict[str, Any]:
                     browser.wait_gone(step.selector)
                 step.status = "done"
             except cbr.BrowserError as exc:
+                if step.tolerate:
+                    step.status = "done"
+                    step.detail = f"{exc} — {step.tolerate}"
+                    result["host_going_down"] = True
+                    break
                 step.status = "failed"
                 step.detail = str(exc)
                 result["error"] = f"{step.op} {step.selector}: {exc}"
@@ -588,6 +818,12 @@ def run_steps(tool: clt.Tool, steps: list[cbr.Step]) -> dict[str, Any]:
         if _BROWSER is not None:
             result["screenshot"] = _BROWSER.screenshot(path)
 
+    # A host on its way down takes the browser's session with it; keeping the
+    # window would only mean the next call inherits a "Disconnected" curtain.
+    if result.get("host_going_down"):
+        _drop_browser()
+        result.pop("dialog_still_open", None)
+
     # The browser outlives this call, so a dialog left standing by a failure
     # would be in the way of the next one. Screenshot first, then clear it.
     if result.get("dialog_still_open") and _BROWSER is not None:
@@ -636,9 +872,8 @@ from the host, but it is a snapshot — call cockpit_refresh() after an action
 to see its effect.
 """
 
-mcp = MCPServer(
+mcp = FastMCP(
     SERVER_NAME,
-    title="Cockpit",
     instructions=INSTRUCTIONS,
     website_url="https://cockpit-project.org",
 )
@@ -910,16 +1145,31 @@ async def cockpit_invoke(name: str, arguments: dict[str, Any] | None = None,
                 return refused
             steps = plan_steps(tool, arguments, dry_run, extra, at, open_with)
             result = await asyncio.to_thread(run_steps, tool, steps)
+        if result.get("performed") and ends_session(name, arguments, extra, at):
+            result["host_going_down"] = True
+
         # the action changed the host; the state everything else reports must
         # not keep describing the host as it was before it
         if result.get("performed") and not dry_run:
-            await asyncio.to_thread(CATALOG.refresh_live)
+            if result.get("host_going_down"):
+                # There is nothing left to read it from, and trying would spend
+                # a connection timeout only to report a host with nothing on it.
+                notes.append("the host is going down, so its state was not read "
+                             "again; cockpit_refresh() once it is back")
+            else:
+                await asyncio.to_thread(CATALOG.refresh_live)
 
     carried = result.pop("note", None)          # what the backend itself said
     if carried:
         notes.insert(0, carried)
     result.update({"tool": name, "title": tool.title, "dry_run": dry_run,
-                   "arguments": arguments, "state_after": _state(tool.context)})
+                   "arguments": arguments})
+    # A host on its way down has a state, and it is the one from before the
+    # call: four days of uptime printed under a reboot that just succeeded.
+    # Better to say there is nothing to report than to report that.
+    result["state_after"] = ("not read: the host is going down"
+                             if result.get("host_going_down")
+                             else _state(tool.context))
     if extra:
         result["extra"] = {k: "…" if _SECRET_RE.search(k) else v for k, v in extra.items()}
     if at:
@@ -1073,11 +1323,12 @@ def main(argv: list[str] | None = None) -> int:
         clt.log("scanning the host before serving (--prefetch)")
         CATALOG.build()
 
+    mcp.settings.port = args.port
     try:
         if args.transport == "stdio":
             mcp.run("stdio")
         else:
-            mcp.run(args.transport, port=args.port)        # type: ignore[arg-type]
+            mcp.run(args.transport)
     finally:
         _drop_browser()
         cbg.BRIDGE.close()

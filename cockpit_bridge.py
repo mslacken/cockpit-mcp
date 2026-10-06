@@ -59,6 +59,8 @@ USAGE
     ./cockpit_bridge.py --insecure https://myhost:9090            # check access
     ./cockpit_bridge.py --insecure https://myhost:9090 \
         --probe bridgeprobe                     # create and delete an account
+    ./cockpit_bridge.py --insecure https://myhost:9090 \
+        --probe-reboot                          # schedule a reboot, call it off
 
 Environment: COCKPIT_USER, COCKPIT_PASSWORD — as for the other two scripts.
 """
@@ -69,6 +71,7 @@ import argparse
 import getpass
 import json
 import os
+import re
 import shlex
 import struct
 import sys
@@ -114,6 +117,11 @@ class Call:
     detail: str = ""
     status: str = "pending"                     # pending | done | failed | skipped
     output: str = ""
+    # "shutdown --reboot +0" is answered by the host going away, which looks
+    # exactly like a failure from here: the channel closes with a problem, or
+    # the socket dies mid-call. Only the call itself knows that this is the
+    # expected answer, so it says so.
+    takes_host_down: bool = False
 
     def render(self) -> str:
         """The call as a line a human can check before it is run."""
@@ -133,8 +141,10 @@ class Call:
         return out
 
 
-def spawn(argv: list[str], stdin: str | None = None, detail: str = "") -> Call:
-    return Call("spawn", argv=[str(a) for a in argv], stdin=stdin, detail=detail)
+def spawn(argv: list[str], stdin: str | None = None, detail: str = "",
+          takes_host_down: bool = False) -> Call:
+    return Call("spawn", argv=[str(a) for a in argv], stdin=stdin, detail=detail,
+                takes_host_down=takes_host_down)
 
 
 def dbus(service: str, path: str, interface: str, method: str, args: list[Any],
@@ -294,6 +304,7 @@ class PrivilegedSession(clt.Session):
         """
         result: dict[str, Any] = {"performed": False, "access": self.access,
                                   "backend": "bridge"}
+        going_down = False
         for call in calls:
             try:
                 if call.op == "spawn":
@@ -303,6 +314,10 @@ class PrivilegedSession(clt.Session):
                                              call.interface, call.method, call.args)
                     out = "" if reply in (None, []) else json.dumps(reply)
             except (OSError, ConnectionError, struct.error) as exc:
+                if call.takes_host_down:
+                    call.status, call.detail = "done", f"{GOING_DOWN} ({exc})"
+                    going_down = True
+                    break
                 call.status = "failed"
                 call.detail = f"the transport died: {exc}"
                 result["error"] = call.detail
@@ -311,6 +326,10 @@ class PrivilegedSession(clt.Session):
             call.output = (out or "").strip()
             problem = close.get("problem")
             status = close.get("exit-status")
+            if problem and call.takes_host_down and _lost(problem):
+                call.status, call.detail = "done", f"{GOING_DOWN} ({problem})"
+                going_down = True
+                break
             if problem or status:
                 call.status = "failed"
                 # "message" is the command's own stderr, which err:"message"
@@ -319,11 +338,45 @@ class PrivilegedSession(clt.Session):
                 call.detail = str(why).strip()
                 result["error"] = f"{call.render()}: {call.detail}"
                 break
+            # A command that succeeded and still said something said the one
+            # thing worth reading: shutdown(1) writes "Reboot scheduled for …"
+            # to stderr, which err:"message" put in the close message.
+            if not call.output and close.get("message"):
+                call.output = str(close["message"]).strip()
             call.status = "done"
         else:
             result["performed"] = bool(calls)
+        if going_down:
+            # The command ran; what did not come back is the host. Calls after
+            # it are not attempted — there is nothing left to attempt them on.
+            result["performed"] = True
+            result["transport_lost"] = True
+        # Usually it does not come to that: "shutdown --reboot +0" answers
+        # before logind gets round to killing the session, and the call looks
+        # like any other success. The host is on its way down either way, and
+        # a caller told otherwise would read a four-day uptime off a machine
+        # that is rebooting.
+        if any(call.takes_host_down and call.status == "done" for call in calls):
+            result["host_going_down"] = True
         result["steps"] = [c.as_json() for c in calls]
         return result
+
+
+GOING_DOWN = ("the host stopped answering — which, for this call, is it doing "
+              "what it was told")
+
+# A host that went down under us is reported in too many ways to enumerate —
+# "disconnected" and "terminated" from the bridge, "timeout" from _collect(),
+# and whatever the socket raised when it was torn down mid-call. So the test
+# runs the other way: these are the problems that mean the bridge was there
+# and said no, and everything else, for a call that was going to take the
+# host down, means it did.
+_REFUSALS = ("access-denied", "authentication-failed", "not-found",
+             "not-supported", "too-large")
+
+
+def _lost(problem: str) -> bool:
+    return not any(token in str(problem) for token in _REFUSALS)
 
 
 def _dbus_error(error: Any) -> str:
@@ -571,6 +624,61 @@ def _rename_group(req: Request) -> list[Call]:
                   detail=f"rename {group} to {new}")]
 
 
+# --------------------------------------------------- the host itself: reboot
+
+# pkg/lib/cockpit-components-shutdown.jsx onSubmit():
+#
+#     const arg = this.props.shutdown ? "--poweroff" : "--reboot";
+#     cockpit.spawn(["shutdown", arg, this.state.when, this.state.message],
+#                   { superuser: "require", err: "message" })
+#
+# `when` is the dialog's Delay select, as shutdown(1) spells it: "+0" for "No
+# delay" through "+60", or "+N" minutes worked out from a date and a time. It
+# starts at "+1" — a Cockpit reboot is a reboot in one minute unless the user
+# says otherwise, and that default is worth keeping, because it is the only
+# thing standing between a mistaken call and a host that is already gone.
+# The message is passed whether or not it is empty.
+
+_NOW = ("0", "+0", "now", "immediately", "immediate", "none", "no delay", "no_delay")
+
+
+def when(req: Request) -> tuple[str, bool]:
+    """The Delay as shutdown(1) wants it, and whether it means "right now"."""
+    raw = req.value("delay", "when", "minutes", "time")
+    if raw in (None, ""):
+        return "+1", False                       # the dialog's own default
+    text = str(raw).strip()
+    if text.lower() in _NOW:
+        return "+0", True
+    if text.lstrip("+").isdigit():
+        return "+" + text.lstrip("+"), False
+    if re.fullmatch(r"\d{1,2}:\d{2}", text):     # "23:30", which shutdown takes
+        return text, False
+    raise Unsupported(f"delay={raw!r} is not a number of minutes, \"now\" or HH:MM")
+
+
+def _shutdown(reboot: bool) -> Callable[[Request], list[Call]]:
+    def build(req: Request) -> list[Call]:
+        at, now = when(req)
+        message = str(req.value("message", "wall",
+                                "message_to_logged_in_users") or "")
+        what = "reboot" if reboot else "power off"
+        return [spawn(["shutdown", "--reboot" if reboot else "--poweroff", at, message],
+                      detail=(f"{what} the host now" if now else
+                              f"schedule a {what} for {at}, which "
+                              f"system_cancel_reboot calls off"),
+                      takes_host_down=now)]
+    return build
+
+
+def _cancel_shutdown(_req: Request) -> list[Call]:
+    # pkg/systemd/overview-cards/shutdownStatus.tsx cancelShutdownAction() —
+    # logind, not "shutdown -c", because that is what the card's button calls.
+    return [dbus("org.freedesktop.login1", "/org/freedesktop/login1",
+                 "org.freedesktop.login1.Manager", "CancelScheduledShutdown", [],
+                 detail="call off the scheduled reboot or poweroff")]
+
+
 # ----------------------------------------------------------------- systemd
 
 S_SERVICE = "org.freedesktop.systemd1"
@@ -621,6 +729,22 @@ ADAPTERS: dict[str, Adapter] = {
     "users_rename_group": Adapter(_rename_group,
         "groupmod <at> --new-name <name> (needs the new name in `extra`)"),
 
+    # the host itself. The overview's split button and its menu only *open*
+    # the dialog in cockpit-components-shutdown.jsx — the scan cannot see that
+    # and lists them as actions, so both names perform the thing they promise.
+    "system_reboot": Adapter(_shutdown(True),
+        "shutdown --reboot <delay> <message>; delay defaults to the dialog's "
+        "+1 minute, extra={\"delay\": \"now\"} goes down immediately"),
+    "system_shutdown": Adapter(_shutdown(False),
+        "shutdown --poweroff <delay> <message> (delay defaults to +1 minute)"),
+    "system_shut_down": Adapter(_shutdown(False),
+        "shutdown --poweroff <delay> <message> (delay defaults to +1 minute)"),
+    # The status card's link, which the scan mislabels and drops — so the
+    # catalog entry for it is hand-written too (cockpit_mcp_server.MISSED).
+    # It is how a reboot scheduled a minute out is called off in time.
+    "system_cancel_reboot": Adapter(_cancel_shutdown,
+                                    "logind CancelScheduledShutdown()"),
+
     # systemd units, addressed by at="sshd.service"
     "system_start": Adapter(_unit_action("StartUnit", ["fail"], "start"),
                             "systemd StartUnit(<at>, fail)"),
@@ -663,6 +787,19 @@ def _accounts(session: PrivilegedSession) -> list[str]:
             and int(line.split(":")[2]) >= 1000]
 
 
+def _scheduled(session: PrivilegedSession) -> str:
+    """What logind has scheduled — what the overview's status card reads."""
+    reply, _close = session.call(
+        "org.freedesktop.login1", "/org/freedesktop/login1",
+        "org.freedesktop.DBus.Properties", "Get",
+        ["org.freedesktop.login1.Manager", "ScheduledShutdown"], superuser=False)
+    # Get() answers with one out argument, and that argument is a variant
+    kind, usec = ((reply or [{}])[0] or {}).get("v") or ("", 0)
+    if not kind:
+        return "nothing scheduled"
+    return f"{kind} at {time.strftime('%H:%M:%S', time.localtime(usec / 1e6))}"
+
+
 def _report(label: str, result: dict[str, Any]) -> bool:
     ok = result.get("performed")
     print(f"  {'ok  ' if ok else 'FAIL'}  {label}")
@@ -689,6 +826,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--probe", metavar="NAME",
                         help="create an account of this name and delete it again, "
                              "which is the end-to-end check of the write path")
+    parser.add_argument("--probe-reboot", action="store_true",
+                        help="schedule a reboot far enough out to call it off "
+                             "again, which is the end-to-end check of the reboot "
+                             "path without rebooting anything")
     parser.add_argument("--list", action="store_true",
                         help="list the catalog actions that have an adapter")
     args = parser.parse_args(argv)
@@ -714,11 +855,28 @@ def main(argv: list[str] | None = None) -> int:
     whoami, _close = session.run(["id", "-un"])
     print(f"  channels run as {whoami.strip()!r}")
 
+    reboot_ok = True
+    if args.probe_reboot:
+        # 99 minutes out, so that a cancel that does not work is still an hour
+        # and a half of warning rather than a surprise.
+        print(f"\nschedule a reboot, then call it off ({_scheduled(session)}):")
+        reboot_ok = _report("system_reboot", BRIDGE.perform(
+            plan("system_reboot", extra={"delay": 99, "message": "cockpit_bridge probe"})))
+        print(f"  logind: {_scheduled(session)}")
+        if reboot_ok:
+            reboot_ok = _report("system_cancel_reboot",
+                                BRIDGE.perform(plan("system_cancel_reboot")))
+            print(f"  logind: {_scheduled(session)}")
+        if not reboot_ok:
+            print("\n  a scheduled reboot may still be standing — call it off "
+                  "with 'shutdown -c' on the host.")
+
     if not args.probe:
-        print(f"\n{len(ADAPTERS)} actions can be performed this way "
-              f"(--list to see them).")
+        if not args.probe_reboot:
+            print(f"\n{len(ADAPTERS)} actions can be performed this way "
+                  f"(--list to see them).")
         BRIDGE.close()
-        return 0
+        return 0 if reboot_ok else 1
 
     name = args.probe
     if name in _accounts(session):
@@ -744,7 +902,7 @@ def main(argv: list[str] | None = None) -> int:
 
     print(f"\n{time.time() - started:.1f}s, {session.calls} channels")
     BRIDGE.close()
-    return 0 if ok else 1
+    return 0 if (ok and reboot_ok) else 1
 
 
 if __name__ == "__main__":

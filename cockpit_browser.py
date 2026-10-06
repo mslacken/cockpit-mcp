@@ -398,6 +398,10 @@ class Step:
     value: Any = None
     status: str = "pending"        # done / skipped / failed
     detail: Any = None
+    # Why a failure of this step is not a failure of the action. The reboot
+    # dialog is the standing case: it closes when the host agrees to go down,
+    # and a page that the reboot has already torn down never gets to.
+    tolerate: str = ""
 
     def as_json(self) -> dict[str, Any]:
         out: dict[str, Any] = {"op": self.op, "status": self.status}
