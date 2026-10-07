@@ -624,6 +624,73 @@ def _rename_group(req: Request) -> list[Call]:
                   detail=f"rename {group} to {new}")]
 
 
+def _unlock_account(req: Request) -> list[Call]:
+    # pkg/users/account-details.js change_locked(true): usermod --unlock. The
+    # "Disallow interactive password" checkbox flips lock and unlock with the
+    # same control, but the catalog can only name the "Lock account" button the
+    # scan finds, so the other side of that checkbox is named by hand.
+    return [spawn(["/usr/sbin/usermod", req.target("account"), "--unlock"],
+                  detail="allow interactive password login again")]
+
+
+def _set_real_name(req: Request) -> list[Call]:
+    # pkg/users/account-details.js changeRealName(): usermod --comment. The
+    # control is an editable text box that commits on blur, so the scan never
+    # sees a "Save" button for it. The dialog refuses a name containing ':' and
+    # the dialog's own check is mirrored here.
+    name = req.target("account")
+    comment = str(req.need("real_name", "full_name", "name", "comment",
+                           what="the full name"))
+    if ":" in comment:
+        raise Unsupported("the full name must not contain a ':'")
+    return [spawn(["/usr/sbin/usermod", name, "--comment", comment],
+                  detail=f"set {name}'s full name")]
+
+
+def _set_password_expiration(req: Request) -> list[Call]:
+    # pkg/users/expiration-dialogs.js: passwd -x <days>. -1 lifts the expiry
+    # (the "Never expire" radio); a positive number is days from now.
+    name = req.target("account")
+    raw = req.value("days", "days_until_expiration",
+                    "number_of_days", "expiration_days")
+    if raw in (None, ""):
+        mode = req.value("mode")
+        if mode in (None, "") or str(mode).lower() in ("never", "no", "unlimited",
+                                                       "disabled", "off"):
+            days = "-1"
+        else:
+            raise Unsupported('the bridge needs the mode ("never" / number of '
+                              'days): pass extra={"days": 90} or '
+                              'extra={"mode": "never"}')
+    else:
+        text = str(raw).strip()
+        if text.lstrip("-").isdigit():
+            days = text
+        else:
+            raise Unsupported(f"days={raw!r} is not an integer or \"never\"")
+    how = "lift the expiry" if days == "-1" else f"expire it after {days} day(s)"
+    return [spawn(["passwd", "-x", days, name],
+                  detail=f"make {name}'s password {how}")]
+
+
+def _add_account_to_group(req: Request) -> list[Call]:
+    # pkg/users/account-details.js addGroup(): gpasswd -a <user> <group>. The
+    # account's groups are edited as chips; adding one is a click on a chip,
+    # which the scan cannot recover as an action.
+    user = req.target("account")
+    group = str(req.need("group", "group_name", what="the group"))
+    return [spawn(["gpasswd", "-a", user, group],
+                  detail=f"add {user} to the group {group}")]
+
+
+def _remove_account_from_group(req: Request) -> list[Call]:
+    # pkg/users/account-details.js removeGroup(): gpasswd -d <user> <group>.
+    user = req.target("account")
+    group = str(req.need("group", "group_name", what="the group"))
+    return [spawn(["gpasswd", "-d", user, group],
+                  detail=f"remove {user} from the group {group}")]
+
+
 # --------------------------------------------------- the host itself: reboot
 
 # pkg/lib/cockpit-components-shutdown.jsx onSubmit():
@@ -698,6 +765,214 @@ def _unit_action(method: str, mode: list[Any], what: str) -> Callable[[Request],
     return build
 
 
+# ---------------------------------------------------------------- storaged
+
+# The storage package talks to UDisks2, and every object it names the caller
+# must address by that object's D-Bus path — the page's own "location"
+# (block_location, a name like "vda") is not enough to reach it. So these
+# builders want the path the way the dialogs have it (client.blocks[…].path),
+# passed in at=/extra. What is not here on purpose is the rest of the page:
+# formatting, mounting and creating a subvolume all write /etc files
+# (fstab, crypttab) on top of their one D-Bus or spawn call, which a recipe
+# cannot express until Call gains a "file" op (the doc's "cannot do yet");
+# and the btrfs subvolume create/delete go through a python btrfs_tool
+# wrapper, not a single call.
+
+U_SERVICE = "org.freedesktop.UDisks2"
+U_ROOT = "/org/freedesktop/UDisks2"
+
+
+def uiface(name: str) -> str:
+    return "org.freedesktop.UDisks2." + name
+
+
+def _as_list(value: Any) -> list[str]:
+    """A UDisks2 member list: the dialog passes as, but one path is enough."""
+    if isinstance(value, (list, tuple)):
+        return [str(v) for v in value]
+    return [str(value)]
+
+
+def _uobject_path(req: Request, what: str) -> str:
+    """The UDisks2 object path of the object addressed by at=/extra.
+
+    The page reaches the same object by name (`block_location`, "vda"): that
+    is not a call target, so a bare name is refused rather than guessed at —
+    the caller has to hand the path, as the dialog has it (client.blocks[…].path).
+    """
+    value = req.value("path", "device_path", "object_path")
+    if value in (None, "") and req.at:
+        value = str(req.at)
+    value = str(value or "").strip()
+    if not value.startswith("/org/freedesktop/UDisks2/"):
+        why = (f"{value!r} is the page's name, which is not a UDisks2 path — "
+               f"pass the path instead" if value and not value.startswith("/")
+               else f"pass the /org/freedesktop/UDisks2/… object path")
+        raise Unsupported(f"this action works on one {what}: {why} "
+                          f"(at=, or extra={{\"path\": \"…\"}})")
+    return value
+
+
+def _dev_path(req: Request, what: str) -> str:
+    """The /dev device node a cryptsetup call wants, by name or at= — a bare
+    name is turned into /dev/<name>, which is exactly what cryptsetup takes."""
+    value = str(req.value("device", "device_path", "dev") or req.at or "").strip()
+    if not value:
+        raise Unsupported(f"this action works on one {what}: pass its "
+                          f"/dev device node (e.g. extra={{\"device\": \"/dev/sda\"}})")
+    if not value.startswith("/dev/"):
+        value = "/dev/" + value.lstrip("/")
+    return value
+
+
+def _unlock_encrypted(req: Request) -> list[Call]:
+    # pkg/storaged/crypto/keyslots.jsx unlock_with_type(): the Encrypted
+    # object's Unlock(<passphrase>), with "read-only" set when the crypttab
+    # entry is readonly. The clevis/stored variants end at the same call
+    # (they only differ in where the passphrase comes from).
+    path = _uobject_path(req, "encrypted drive")
+    passphrase = str(req.need("passphrase", "key", what="the passphrase"))
+    options = {}
+    if req.flag("read_only", "readonly"):
+        options["read-only"] = {"t": "b", "v": True}
+    return [dbus(U_SERVICE, path, uiface("Encrypted"), "Unlock",
+                 [passphrase, options],
+                 detail=f"unlock {path}")]
+
+
+def _change_luks_passphrase(req: Request) -> list[Call]:
+    # pkg/storaged/crypto/keyslots.jsx passphrase_change(): cryptsetup
+    # luksChangeKey <dev> [--key-slot N], the old passphrase on stdin, then
+    # the new one. The "key" the caller has is the slot being re-armed.
+    dev = _dev_path(req, "encrypted drive")
+    old = str(req.need("old_passphrase", what="the current passphrase"))
+    new = str(req.need("new_passphrase", "new_password", what="the new passphrase"))
+    argv = ["cryptsetup", "luksChangeKey", dev]
+    if (slot := req.value("key_slot", "slot")) is not None:
+        argv += ["--key-slot", str(slot)]
+    return [spawn(argv, stdin=f"{old}\n{new}\n",
+                  detail=f"change {dev}'s passphrase")]
+
+
+def _add_luks_passphrase(req: Request) -> list[Call]:
+    # pkg/storaged/crypto/keyslots.jsx passphrase_add(): cryptsetup
+    # luksAddKey <dev>, the current passphrase on stdin, then the new one —
+    # a key is added, the old one stays.
+    dev = _dev_path(req, "encrypted drive")
+    old = str(req.need("old_passphrase", what="a passphrase that opens the drive"))
+    new = str(req.need("new_passphrase", "new_password", what="the passphrase to add"))
+    return [spawn(["cryptsetup", "luksAddKey", dev],
+                  stdin=f"{old}\n{new}",
+                  detail=f"add a passphrase to {dev}, keeping the old one")]
+
+
+def _create_volume_group(req: Request) -> list[Call]:
+    # pkg/storaged/lvm2/create-dialog.jsx: the LVM2 manager's
+    # VolumeGroupCreate(<name>, <block paths>), after prepare_available_spaces
+    # has turned any free space into a real partition. Whole disks are passed
+    # straight through; the member list is what the dialog's "Disks" field held.
+    name = str(req.need("name", what="the volume group name"))
+    members = _as_list(req.need("disks", "members", "pvs",
+                                what="the UDisks2 path (or /dev path) of each member"))
+    return [dbus(U_SERVICE, U_ROOT, uiface("Manager.LVM2"), "VolumeGroupCreate",
+                 [name, members, {}],
+                 detail=f"create the volume group {name} over {len(members)} member(s)")]
+
+
+def _create_raid_device(req: Request) -> list[Call]:
+    # pkg/storaged/mdraid/create-dialog.jsx: Manager.MDRaidCreate(<paths>,
+    # <level>, <name>, <chunk bytes>). The dialog's chunk field is KiB; 0
+    # means "no striping", and it lands in the call verbatim.
+    members = _as_list(req.need("disks", "members", what="the UDisks2 path (or /dev path) of each member"))
+    level = str(req.need("level", what="the RAID level, e.g. raid1"))
+    name = str(req.need("name", what="the RAID device name"))
+    chunk = req.value("chunk")
+    chunk_bytes = int(chunk) * 1024 if chunk not in (None, "") else 0
+    return [dbus(U_SERVICE, U_ROOT, uiface("Manager"), "MDRaidCreate",
+                 [members, level, name, chunk_bytes, {}],
+                 detail=f"create the RAID {level} device {name} over {len(members)} member(s)")]
+
+
+def _create_logical_volume_snapshot(req: Request) -> list[Call]:
+    # pkg/storaged/lvm2/volume-group.jsx create_snapshot(): the logical
+    # volume's CreateSnapshot(<name>, <size>); 0 for "the size it was asked
+    # for" is what the dialog passes when it has no size.
+    path = _uobject_path(req, "logical volume")
+    name = str(req.need("name", what="the snapshot name"))
+    size = req.value("size")
+    size_bytes = int(size) if size not in (None, "") else 0
+    return [dbus(U_SERVICE, path, uiface("LogicalVolume"), "CreateSnapshot",
+                 [name, size_bytes, {}],
+                 detail=f"create the snapshot {name}")]
+
+
+def _start_multipath(_req: Request) -> list[Call]:
+    # pkg/storaged/multipath.jsx activate(): enable multipath and start its
+    # service, which is what the alert's "Start multipath" link does.
+    return [spawn(["mpathconf", "--enable", "--with_multipathd", "y"],
+                   detail="enable multipath and start multipathd")]
+
+
+_FILESYSTEM_TYPES = ("btrfs", "ext4", "xfs", "vfat", "ntfs", "swap",
+                     "ext2", "ext3", "f2fs", "exfat", "minix",
+                     "reiser4", "nilfs2")
+
+
+def _create_filesystem_and_mount(req: Request) -> list[Call]:
+    # The "Format and mount" action of pkg/storaged/block/format-dialog.jsx,
+    # which the dialogs run as
+    #     block.Format(type, options)        # UDisks2
+    # then client.mount_at():
+    #     cockpit.script('set -e; mkdir -p "$2"; mount "$1" "$2" -o "$3"', …)  # client.js:1097
+    #
+    # options carries 'tear-down' and the fstab entry under 'config-items'
+    # (the single Format() call also writes /etc/fstab). That one-call shape
+    # is what a recipe *should* be, but it needs the fstab write (the "file"
+    # Call op the doc lists as missing), and the ay/config-items variant form
+    # does not decode the way udisks2 2.10.1 expects (it reports "opts must
+    # not be blank"). So instead of one D-Bus call that a destructive action
+    # would then fail on, the recipe performs the same effect as a sequence
+    # of the tools the dialog's own call ends up driving — same order, same
+    # result, and it is the sequence that is known to work end to end:
+    #
+    #     wipefs -a <dev>                          # its 'tear-down'
+    #     mkfs.<type> [-L <label>] <dev>           # its Format()
+    #     <fstab install> ; mkdir -p <mp> ; mount  # Format()'s config-items + client.mount_at()
+    ftype = str(req.need("type", "filesystem", "fs_type",
+                          what="the filesystem type (btrfs, ext4, xfs, …)")).lower()
+    if ftype not in _FILESYSTEM_TYPES:
+        raise Unsupported(f"filesystem type {ftype!r} is not one the dialog offers "
+                          f"({', '.join(_FILESYSTEM_TYPES)})")
+    if ftype == "swap":
+        raise Unsupported('the "swap" type has no mount point; the dialog '
+                          'starts it with block_swap.Start() — not covered by this recipe')
+    dev = _dev_path(req, "block device")
+    mount_point = str(req.value("mount_point", "mountpoint", "dir") or "").strip()
+    label = str(req.value("name", "label") or "").strip()
+
+    calls = [spawn(["wipefs", "-a", dev],
+                   detail="remove any existing signatures on the device (the dialog's tear-down)")]
+    mkfs = ["mkfs." + ftype] + (["-L", label] if label else []) + [dev]
+    calls.append(spawn(mkfs, detail=f"format {dev} as {ftype}"))
+
+    if mount_point:
+        if mount_point[0] != "/":
+            mount_point = "/" + mount_point
+        fstab_opts = "nofail" + (",subvol=/" if ftype == "btrfs" else "")
+        # The dialog installs the fstab entry from its own config-items, then
+        # mounts with the dialog's options (nofail by default, +subvol=/ btrfs).
+        # A UUID-keyed entry, added only if absent, so a re-run does not stack
+        # two lines for the same device.
+        script = (f'set -e; uuid="$(blkid -o value -s UUID {dev})"; '
+                  f'grep -qF "UUID=$uuid" /etc/fstab '
+                  f'|| echo "UUID=$uuid {mount_point} auto {fstab_opts} 0 0" >> /etc/fstab; '
+                  f'mkdir -p {mount_point}; mount {dev} {mount_point} -o {fstab_opts}')
+        calls.append(spawn(["sh", "-c", script],
+                           detail=f"write the fstab entry for {mount_point}, "
+                                 f"create it, and mount {dev} there"))
+    return calls
+
+
 ADAPTERS: dict[str, Adapter] = {
     # users: the dialogs that perform the action …
     "users_accounts_create": Adapter(_create_account,
@@ -705,6 +980,7 @@ ADAPTERS: dict[str, Adapter] = {
     "users_account_confirm_delete": Adapter(_delete_account,
         "userdel [-r] <at>"),
     "users_account_confirm_lock": Adapter(_lock_account, "usermod <at> --lock"),
+    "users_account_confirm_unlock": Adapter(_unlock_account, "usermod <at> --unlock"),
     "users_account_confirm_logout": Adapter(_logout_account,
         "loginctl terminate-user <at>"),
     "users_account_set_password": Adapter(_set_password,
@@ -725,6 +1001,14 @@ ADAPTERS: dict[str, Adapter] = {
     "users_terminate_session": Adapter(_logout_account,
         "loginctl terminate-user <at>"),
     "users_force_change": Adapter(_force_password_change, "passwd -e <at>"),
+    "user_set_real_name": Adapter(_set_real_name,
+        "usermod <at> --comment <name> (needs the full name in `extra`)"),
+    "user_set_password_expiry": Adapter(_set_password_expiration,
+        "passwd -x <days> <at> (needs days or mode in `extra`; \"never\" is -1)"),
+    "user_add_to_group": Adapter(_add_account_to_group,
+        "gpasswd -a <at> <group> (needs the group in `extra`)"),
+    "user_remove_from_group": Adapter(_remove_account_from_group,
+        "gpasswd -d <at> <group> (needs the group in `extra`)"),
     "users_delete_group": Adapter(_delete_group, "groupdel [-f] <at>"),
     "users_rename_group": Adapter(_rename_group,
         "groupmod <at> --new-name <name> (needs the new name in `extra`)"),
@@ -759,6 +1043,42 @@ ADAPTERS: dict[str, Adapter] = {
     "system_clear_failed_to_start": Adapter(
         _unit_action("ResetFailedUnit", [], "clear the failed state of"),
         "systemd ResetFailedUnit(<at>)"),
+
+    # storaged. These address their object by D-Bus path (at= or extra=), the
+    # way client.blocks[…].path does — the page's "vda" name is not enough.
+    # What is not here is what a recipe cannot say: formatting and mounting
+    # write fstab/crypttab on top of one call (needs a "file" Call op), and
+    # the btrfs subvolume ops wrap their create/delete in a python tool.
+    "storage_unlock": Adapter(_unlock_encrypted,
+        "UDisks2 Encrypted.Unlock(<passphrase>) on <at> (needs the UDisks2 path "
+        "of an encrypted drive)"),
+    "storage_change_passphrase": Adapter(_change_luks_passphrase,
+        "cryptsetup luksChangeKey <dev> (needs the drive, old and new passphrase in `extra`)"),
+    "storage_add_passphrase": Adapter(_add_luks_passphrase,
+        "cryptsetup luksAddKey <dev> (needs the drive, an existing and a new passphrase in `extra`)"),
+    "storage_create_volume_group": Adapter(_create_volume_group,
+        "UDisks2 LVM2 VolumeGroupCreate(<name>, <members>) (needs name and member paths)"),
+    "storage_create_raid_device": Adapter(_create_raid_device,
+        "UDisks2 Manager MDRaidCreate(<members>, <level>, <name>, <chunk>)"),
+    "storage_create_snapshot": Adapter(_create_logical_volume_snapshot,
+        "UDisks2 LogicalVolume.CreateSnapshot(<name>, <size>) on <at>"),
+    "storage_start_multipath": Adapter(_start_multipath,
+        "mpathconf --enable --with_multipathd y"),
+
+    # Format <device> as <type>, and optionally install the fstab entry and
+    # mount it — the effect of pkg/storaged/block/format-dialog.jsx
+    # "Format and mount", performed as the tools that call ends up driving
+    # (wipefs, mkfs.<type>, then fstab install + mkdir + mount). `type` and
+    # `mount_point` go in `extra` (the schema the scan recovers does not
+    # name them); `at=` is the /dev device (or extra={"device": "/dev/…"}).
+    "storage_create_filesystem": Adapter(_create_filesystem_and_mount,
+        "wipefs → mkfs.<type> <dev>, then (when mount_point is given) the "
+        "fstab entry + mkdir -p + mount "
+        "(needs the type in `extra` and, to mount, the mount_point)"),
+    "storage_format_and_mount": Adapter(_create_filesystem_and_mount,
+        "wipefs → mkfs.<type> <dev>, then (when mount_point is given) the "
+        "fstab entry + mkdir -p + mount "
+        "(needs the type in `extra` and, to mount, the mount_point)"),
 }
 
 

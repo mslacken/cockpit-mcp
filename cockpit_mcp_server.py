@@ -180,6 +180,58 @@ MISSED = [
                        "otherwise, so this is how a reboot is taken back.",
            package="system", page_path="index.html",
            control_id="system-health-shutdown-status-cancel-btn"),
+
+    # The account-details page has the same problem, and worse: most of its
+    # controls never become actions at all. "Unlock" is the other way of the
+    # "Disallow interactive password" checkbox the scan does find (which it
+    # labels "Lock account"); the full name is an editable text box that
+    # commits on blur, so there is no button to name; the two expiry radios in
+    # the "Password expiration" dialog and the group chips are controls the
+    # heuristic does not recover as actions. Each has a dialog button the
+    # scan does not see, so each is reached by name as system_cancel_reboot is.
+    Missed(name="users_account_confirm_unlock",
+           title="Unlock account",
+           description="Allow interactive password login again, the other way "
+                       "of the account-details page's \"Disallow interactive "
+                       "password\" checkbox. Locking it (the checkbox's one "
+                       "way) is what users_account_confirm_lock performs; this "
+                       "is how that is taken back.",
+           package="users", page_path="index.html",
+           control_id="account-locked"),
+    Missed(name="user_set_real_name",
+           title="Set account full name",
+           description="Set an account's full name (the comment field in "
+                       "/etc/passwd). The account-details page edits this as a "
+                       "text box that saves when you leave it, so the scan "
+                       "finds no button. Needs the name, e.g. "
+                       "extra={\"real_name\": \"Chris P.\"}.",
+           package="users", page_path="index.html",
+           control_id="account-real-name"),
+    Missed(name="user_set_password_expiry",
+           title="Set password expiry",
+           description="Set how long before an account's password expires. 0 "
+                       "or \"never\" lifts the expiry (the \"Never expire\" "
+                       "radio); a number of days makes it expire that long "
+                       "from now. Needs e.g. extra={\"days\": 90} or "
+                       "extra={\"mode\": \"never\"}.",
+           package="users", page_path="index.html",
+           control_id="password-expiration-button"),
+    Missed(name="user_add_to_group",
+           title="Add account to group",
+           description="Put an account into a group, which the account-details "
+                       "page does one group at a time by clicking a group "
+                       "chip. Needs the group, e.g. extra={\"group\": "
+                       "\"chris\"}, and names the account with at=.",
+           package="users", page_path="index.html",
+           control_id="account-groups-form-group"),
+    Missed(name="user_remove_from_group",
+           title="Remove account from group",
+           description="Take an account out of a group, the reverse of "
+                       "user_add_to_group. Needs the group, e.g. "
+                       "extra={\"group\": \"chris\"}, and names the account "
+                       "with at=.",
+           package="users", page_path="index.html",
+           control_id="account-groups-form-group"),
 ]
 
 
