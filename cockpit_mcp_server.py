@@ -19,7 +19,7 @@ call — the server offers a handful of tools *over* the catalog:
     cockpit_list_pages(package)             the map: packages, pages, live state
     cockpit_search_tools(query, …)          find the actions that match a need
     cockpit_describe_tool(name)             one action in full: schema + state
-    cockpit_invoke(name, arguments, …)      perform it, for real, in a browser
+    cockpit_invoke(name, arguments, …)      perform it, for real, over the bridge
     cockpit_refresh(full)                   re-read the host
 
 Every answer carries the live state of the page it concerns, which is the half
@@ -27,38 +27,33 @@ a caller cannot infer: "Delete account" means nothing without knowing which
 accounts there are, and `cockpit_search_tools("delete account")` says both.
 
 INVOKING IS REAL
-================
+===============
 Cockpit's UI *is* its API: a page is a React bundle talking to cockpit-bridge
-over its own WebSocket, so there is no endpoint behind "Create account" to
-call instead. cockpit_invoke performs an action one of two ways, and either
-way what the action does to the host, it really does:
+over its own WebSocket. For most dialog buttons the bundle only says which
+button exists, not what it does, so there is no generic way to press one.
+cockpit_invoke therefore performs an action the one way the call is actually
+known:
 
-  * **the bridge** (cockpit_bridge.py) for the actions whose call is known —
-    the same ``cockpit.spawn(["/usr/sbin/userdel", "-r", name], {superuser:
+  * **the bridge** (cockpit_bridge.py) — the same
+    ``cockpit.spawn(["/usr/sbin/userdel", "-r", name], {superuser:
     "require"})`` the dialog's own button makes, sent on the same protocol the
     page uses. No browser, about a tenth of a second. The recipes are
     hand-written from the page sources, because a bundle says which button
-    exists but not what it does;
-  * **a headless Chromium** (cockpit_browser.py) for everything else: log in,
-    open the page, press the button that opens the dialog, fill the fields
-    from ``arguments``, press the one that confirms it.
+    exists but not what it does.
 
-``backend`` chooses; by default an action with a bridge recipe uses it and the
-rest use the browser, so a host with no chromium installed can still perform
-everything in cockpit_bridge.ADAPTERS (``--no-browser`` makes that explicit,
-``--no-bridge`` sends everything through the UI).
+Only the actions cockpit_bridge.ADAPTERS has a recipe for can be performed;
+every other action in the catalog is reported as one that this server cannot
+do rather than attempted (there is no UI to drive it through).
 
-Two gates sit in front of both:
+Two gates sit in front of it:
 
   * an action the catalog marks destructive needs ``confirm=true`` — without
     it the call returns the plan it would have run and changes nothing;
-  * ``dry_run=true`` performs nothing: in the browser it walks the whole path
-    — navigate, open the dialog, fill every field — and presses Cancel
-    instead of the confirming button, which is the way to check that a tool's
-    recovered selectors still fit the UI; over the bridge it reports the
-    exact calls it would make.
+  * ``dry_run=true`` performs nothing: over the bridge it reports the exact
+    calls it would make.
 
-``--read-only`` turns every invocation into a dry run.
+``--read-only`` turns every invocation into a dry run, and ``--no-bridge``
+leaves nothing that can perform an action (``--read-only`` is what you want).
 
 USAGE
 =====
@@ -71,8 +66,8 @@ USAGE
         "args": ["/path/to/cockpit_mcp_server.py", "--insecure", "https://myhost:9090"],
         "env": {"COCKPIT_USER": "chris", "COCKPIT_PASSWORD": "…"}}}}
 
-The password is needed twice over: once for the HTTP session that reads the
-catalog, once for the browser session that drives it.
+The password is needed twice over: once for the session that reads the catalog,
+once for the privileged bridge session that performs the calls.
 """
 
 from __future__ import annotations
@@ -91,7 +86,6 @@ from dataclasses import dataclass, field
 from typing import Any
 
 import cockpit_bridge as cbg
-import cockpit_browser as cbr
 import cockpit_list_tools as clt
 from mcp.server.fastmcp import FastMCP
 
@@ -110,12 +104,8 @@ class Config:
     password: str = ""
     packages: list[str] = field(default_factory=list)
     insecure: bool = False
-    browser: str | None = None
-    headless: bool = True
     read_only: bool = False
-    screenshot_dir: str | None = None
     use_bridge: bool = True             # perform what can be performed directly
-    use_browser: bool = True            # … and drive the UI for the rest
 
     def apply(self) -> None:
         """Point cockpit_list_tools' module-level connection settings at us."""
@@ -249,11 +239,6 @@ class Catalog:
                 cookie, _ = clt.connect()
                 clt.probe_live(packages, cookie)
         tools = clt.build_tools(packages) + missed_tools(packages)
-        for tool in tools:
-            fix = UI_FIXUPS.get(tool.name)
-            if fix and fix.params and not tool.params:
-                tool.params = list(fix.params)
-
         self.cookie = cookie
         self.packages = packages
         self.tools = tools
@@ -328,7 +313,7 @@ class Catalog:
 
 CATALOG = Catalog()
 _BUILD_LOCK = asyncio.Lock()
-_DRIVE_LOCK = asyncio.Lock()        # one browser, one action at a time
+_DRIVE_LOCK = asyncio.Lock()        # one bridge session, one action at a time
 
 
 async def catalog(live: bool = True) -> Catalog:
@@ -410,284 +395,14 @@ def _full(tool: clt.Tool) -> dict[str, Any]:
     out["state"] = _state(tool.context)
     out["destructive"] = tool.destructive
     out["needs_confirm"] = needs_confirm(tool)
-    out["plan"] = [step.as_json() for step in plan_steps(tool, {}, dry_run=False)]
     adapter = cbg.adapter_for(tool.name) if CONFIG.use_bridge else None
-    out["backend"] = "bridge" if adapter else "browser"
+    out["backend"] = "bridge" if adapter else "none"
     if adapter:
-        # The plan above is the UI path, which backend="browser" still takes;
-        # this is what the action actually runs by default.
         out["bridge_call"] = adapter.summary
-    fix = UI_FIXUPS.get(tool.name)
-    if fix:
-        # The scan read this button wrong; say so, because the description and
-        # the control it names come from the scan and still read as fact.
-        out["ui_note"] = fix.why
+    else:
+        out["note"] = ("this action has no bridge recipe, so this server can "
+                       "only describe it, not perform it")
     return out
-
-
-# ==========================================================================
-# From a tool definition to a sequence of things to do to the page
-# ==========================================================================
-#
-# A tool's "cockpit" metadata says where its action lives: the page, the
-# dialog that performs it, the control that opens that dialog, the one that
-# confirms it, and one selector per input. Turning that into steps is mostly
-# bookkeeping, with one judgement call: where the scan recovered no explicit
-# confirm/cancel selector, the button is found by its caption inside the
-# dialog — ":contains()" the way Cockpit's own tests spell it.
-
-def _caption_selector(dialog: str, caption: str) -> str:
-    return f'{dialog} button:contains("{caption}")'
-
-
-# --------------------------------------------------------------------------
-# Where the scan reads the page wrong, and a human has read it right
-# --------------------------------------------------------------------------
-#
-# The scan recovers a control and, when the bundle shows one, the dialog it
-# opens. Both halves can be wrong about the same button: the overview's
-# "Reboot" is an <id="reboot"> item of a dropdown that is not in the DOM until
-# its toggle is pressed, and pressing it does not reboot anything — it opens
-# #shutdown-dialog, whose danger button does. The catalog therefore lists
-# system_reboot as a page-level action on #reboot, and invoking it waits 20
-# seconds for a control that is not there.
-#
-# Nothing in the bundle says otherwise (the onClick is
-# ``Dialogs.show(<ShutdownModal />)``, which is exactly the React indirection
-# the scan cannot follow), so this is the browser's equivalent of
-# cockpit_bridge.ADAPTERS: hand-written entries, each transcribed from the
-# page source and from the selectors Cockpit's own test for it uses.
-
-@dataclass
-class Fixup:
-    """What the page really does, for an action the scan read wrong."""
-    open: list[str] = field(default_factory=list)   # clicks that open the dialog
-    dialog: str = ""
-    confirm: str = ""
-    action: str = ""                                # what that button is captioned
-    why: str = ""
-    # Fills the dialog's own fields. It replaces the generic `extra` handling,
-    # because these fields are not labelled inputs the browser can find by
-    # caption — the Delay is a PatternFly menu, which is two clicks.
-    fill: Any = None                                # (cbg.Request) -> [Step]
-    # True when performing this leaves no page behind to confirm it with.
-    ends_session: Any = None                        # (cbg.Request) -> bool
-    params: list[clt.ToolParam] = field(default_factory=list)
-
-
-# The Delay select offers these and nothing else (cockpit-components-shutdown
-# .jsx render()); anything else is a job for the bridge, which passes the
-# delay straight to shutdown(1).
-_DELAY_OPTIONS = {"+0": "No delay", "+1": "1 minute", "+5": "5 minutes",
-                  "+20": "20 minutes", "+40": "40 minutes", "+60": "60 minutes"}
-
-_SHUTDOWN_PARAMS = [
-    clt.ToolParam(
-        name="delay",
-        type="string",
-        description="When to perform the action (e.g. '+0' or 'now', '+1', '+5', '+20', '+40', '+60')",
-        required=False,
-        choices=list(_DELAY_OPTIONS.items()) + [("now", "No delay")],
-    ),
-    clt.ToolParam(
-        name="message",
-        type="string",
-        description="Warning message broadcast to logged-in users",
-        required=False,
-    ),
-]
-
-
-def _fill_shutdown_dialog(req: cbg.Request) -> list[cbr.Step]:
-    """#shutdown-dialog's two fields, pressed as check-system-shutdown-restart
-    presses them: #message is a textarea, Delay is a menu toggle plus an item.
-    """
-    steps: list[cbr.Step] = []
-    message = req.value("message", "wall", "message_to_logged_in_users")
-    if message:
-        steps.append(cbr.Step("set", selector="#message", value=str(message),
-                              detail="the message logged-in users are warned with"))
-    if req.value("delay", "when", "minutes", "time") is None:
-        return steps                        # leave the dialog's own 1 minute
-    option = _DELAY_OPTIONS.get(cbg.when(req)[0])
-    if option is None:
-        steps.append(cbr.Step("set", value=req.value("delay", "when"), status="skipped",
-                              detail="the dialog's Delay menu only offers " +
-                                     ", ".join(_DELAY_OPTIONS.values()) +
-                                     "; backend=\"bridge\" takes any delay"))
-        return steps
-    steps.append(cbr.Step("click", selector="#delay", detail="open the Delay menu"))
-    steps.append(cbr.Step("click", selector=f'button:contains("{option}")',
-                          detail=f"choose {option}"))
-    return steps
-
-
-def _immediately(req: cbg.Request) -> bool:
-    try:
-        return cbg.when(req)[1]
-    except cbg.Unsupported:
-        return False
-
-
-def ends_session(name: str, arguments: dict[str, Any], extra: dict[str, Any],
-                 at: str | None) -> bool:
-    """Whether performing this leaves no host behind to ask about it.
-
-    Both backends need the same answer, and neither can be trusted to notice
-    on its own: the browser's dialog closes normally on its way down, and the
-    bridge's "shutdown --reboot +0" usually answers before logind kills the
-    session. What settles it is the delay that was asked for.
-    """
-    fix = UI_FIXUPS.get(name)
-    if not (fix and fix.ends_session):
-        return False
-    return bool(fix.ends_session(cbg.Request(dict(arguments), dict(extra), at)))
-
-
-_SHUTDOWN_DIALOG = {
-    "dialog": "#shutdown-dialog",
-    # The footer's danger button, which is how Cockpit's own test addresses it
-    # — the caption differs between Reboot and Shut down, the styling does not.
-    "confirm": "#shutdown-dialog button.pf-m-danger",
-    "fill": _fill_shutdown_dialog,
-    "ends_session": _immediately,
-    "params": _SHUTDOWN_PARAMS,
-}
-
-UI_FIXUPS: dict[str, Fixup] = {
-    "system_reboot": Fixup(
-        # the split button, which is always there when the session is
-        # privileged — #reboot, which the scan found, is the same action
-        # hidden inside the menu that #shutdown-group opens
-        open=["#reboot-button"],
-        action="Reboot",
-        why="#reboot is a menu item that only exists while the shutdown menu "
-            "is open, and it opens #shutdown-dialog rather than rebooting; the "
-            "split button #reboot-button opens the same dialog directly",
-        **_SHUTDOWN_DIALOG),
-    "system_shutdown": Fixup(
-        open=["#shutdown-group", "#shutdown"],
-        action="Shut down",
-        why="#shutdown is an item of the menu that #shutdown-group opens, and "
-            "it opens #shutdown-dialog rather than powering the host off",
-        **_SHUTDOWN_DIALOG),
-    "system_shut_down": Fixup(
-        open=["#shutdown-group", "#shutdown"],
-        action="Shut down",
-        why="\"Shut down\" is #shutdown-dialog's own confirming button; the "
-            "menu item that opens that dialog is #shutdown",
-        **_SHUTDOWN_DIALOG),
-    "storage_initialize": Fixup(
-        open=[
-            ".pf-v6-c-card .pf-v6-c-menu-toggle, .pf-v5-c-card .pf-v5-c-menu-toggle",
-            'button:contains("Create partition table"), .pf-v6-c-menu__item:contains("Create partition table"), .pf-v5-c-menu__item:contains("Create partition table")',
-        ],
-        dialog="#dialog",
-        action="Initialize",
-        confirm="#dialog button.pf-m-danger, #dialog button.btn-danger",
-        why="the opener is inside the drive card kebab menu as 'Create partition table'",
-    ),
-}
-
-
-def plan_steps(tool: clt.Tool, arguments: dict[str, Any], dry_run: bool,
-               extra: dict[str, Any] | None = None, at: str | None = None,
-               open_with: str | None = None) -> list[cbr.Step]:
-    """The steps that perform ``tool`` with ``arguments``."""
-    fix = UI_FIXUPS.get(tool.name)
-    req = cbg.Request(dict(arguments), dict(extra or {}), at)
-    sel = dict(tool.selectors or {})
-    action = tool.action
-    if fix:
-        sel["dialog"] = fix.dialog or sel.get("dialog")
-        action = fix.action or action
-        if fix.confirm:
-            sel["apply"] = fix.confirm
-    route = _route(tool.package, tool.page_path)
-    # An action on one of the objects a page lists lives on that object's own
-    # view, which Cockpit addresses by hash: /users#/chris, /network#/ens4.
-    # Without it the page shows its list, where the button is not.
-    if at:
-        route += at if at.startswith("#") else "#/" + at.lstrip("/")
-    steps = [cbr.Step("goto", selector=route)]
-
-    dialog = sel.get("dialog")
-    if open_with:
-        steps.append(cbr.Step("click", selector=open_with,
-                              detail="opens the dialog (named by the caller)"))
-    elif fix and fix.open:
-        steps += [cbr.Step("click", selector=selector, detail=fix.why)
-                  for selector in fix.open]
-    elif sel.get("open"):
-        steps.append(cbr.Step("click", selector=sel["open"], detail="opens the dialog"))
-    elif tool.opens_via and dialog:
-        # the opener was recovered as a caption, not an id
-        steps.append(cbr.Step("click", selector=f'button:contains("{tool.opens_via}")',
-                              detail="opens the dialog"))
-    elif dialog and tool.action:
-        # Nothing in the bundle said what opens this dialog — the call site is
-        # in another module, or in a row the page renders from data. The page
-        # button that opens a dialog is almost always captioned like the
-        # dialog's own confirming button ("Delete" opens "Delete mcptest",
-        # which is confirmed with "Delete"), so try that, and say it is a
-        # guess: the step reports what it pressed and how many matched.
-        steps.append(cbr.Step("click", selector=f'button:contains("{tool.action}")',
-                              detail="opens the dialog (guessed: the scan found no opener)"))
-
-    if dialog:
-        steps.append(cbr.Step("wait", selector=dialog, detail="the dialog is up"))
-
-    if fix and fix.fill:
-        # This dialog's fields are written out by hand, so `extra` is read by
-        # the fixup rather than guessed at by caption.
-        steps += fix.fill(req)
-    else:
-        for param in tool.params:
-            if param.name not in arguments:
-                continue
-            selector = param.selector or (f"#{param.control_id}" if param.control_id else None)
-            if not selector:
-                steps.append(cbr.Step("set", value=arguments[param.name], status="skipped",
-                                      detail=f"no selector was recovered for {param.name!r}"))
-                continue
-            steps.append(cbr.Step("set", selector=selector, value=arguments[param.name],
-                                  detail=param.kind or None))
-        # Fields the scan never recovered. The create-account dialog's two
-        # password boxes are the standing example: they are built by a shared
-        # React component, so no selector for them survives into the bundle's
-        # page code, and without them the dialog's Create button never enables.
-        for label, value in (extra or {}).items():
-            steps.append(cbr.Step("set-label", selector=label, value=value,
-                                  detail="a field the catalog did not name"))
-
-    if dialog:
-        confirm = sel.get("apply") or _caption_selector(dialog, action or "Apply")
-        cancel = sel.get("cancel") or _caption_selector(dialog, "Cancel")
-        if dry_run:
-            steps.append(cbr.Step("cancel", selector=cancel,
-                                  detail="dry run: the action is abandoned here"))
-        else:
-            steps.append(cbr.Step("confirm", selector=confirm,
-                                  detail=f"confirms the action ({action or 'apply'})"))
-            gone = cbr.Step("wait-gone", selector=dialog,
-                            detail="the dialog closes when the action succeeded")
-            if fix and fix.ends_session and fix.ends_session(req):
-                # The dialog closes when the spawn resolves — but the host is
-                # on its way down, and a page that dies first never gets to
-                # close it. Either way the action happened.
-                gone.tolerate = ("the page stopped answering, which is what "
-                                 "this action does to it")
-            steps.append(gone)
-    else:
-        # a page-level action: the control *is* the action
-        control = sel.get("control") or (f"#{tool.control_id}" if tool.control_id else None)
-        if not control:
-            control = f'button:contains("{tool.action or tool.title}")'
-        step = cbr.Step("confirm", selector=control, detail="performs the action")
-        if dry_run:
-            step.status, step.detail = "skipped", "dry run: the action is not performed"
-        steps.append(step)
-    return steps
 
 
 # ==========================================================================
@@ -722,151 +437,6 @@ def validate(tool: clt.Tool, arguments: dict[str, Any]) -> list[str]:
 
 
 # ==========================================================================
-# Driving: the browser, kept alive between calls
-# ==========================================================================
-
-_BROWSER: cbr.CockpitBrowser | None = None
-
-
-def _browser() -> cbr.CockpitBrowser:
-    """The logged-in browser, started on first use.
-
-    One browser for the life of the server: a login costs a session on the
-    host and a few seconds, and calls come one after another on the same host.
-    """
-    global _BROWSER
-    if _BROWSER is not None and _BROWSER.cdp is not None:
-        return _BROWSER
-    target = cbr.Target(clt.HOST, clt.PORT, tls=clt.USE_TLS, insecure=CONFIG.insecure)
-    browser = cbr.CockpitBrowser(target, browser=CONFIG.browser,
-                                 headless=CONFIG.headless, manifest_host=CATALOG.host
-                                 or clt.MANIFEST_HOST)
-    browser.start()
-    browser.login(CONFIG.user, CONFIG.password, superuser=True)
-    if "Administrative" not in (browser.superuser or ""):
-        browser.become_superuser(CONFIG.password)
-    _BROWSER = browser
-    return browser
-
-
-def _drop_browser() -> None:
-    global _BROWSER
-    if _BROWSER is not None:
-        with contextlib.suppress(Exception):
-            _BROWSER.stop()
-        _BROWSER = None
-
-
-def run_steps(tool: clt.Tool, steps: list[cbr.Step]) -> dict[str, Any]:
-    """Perform the steps in the browser. Blocking; called in a worker thread."""
-    result: dict[str, Any] = {"performed": False, "backend": "browser"}
-    dialog = (tool.selectors or {}).get("dialog")
-
-    try:
-        # Inside the try: on a machine with no chromium this is where the
-        # whole path fails, and the caller is owed the reason rather than an
-        # exception out of the tool call.
-        browser = _browser()
-        result["access"] = browser.superuser
-        for step in steps:
-            if step.status == "skipped":
-                continue
-            try:
-                if step.op == "goto":
-                    assert step.selector
-                    result["frame"] = browser.enter_page(step.selector)
-                elif step.op in ("click", "confirm", "cancel"):
-                    assert step.selector
-                    step.detail = browser.click(step.selector) or step.detail
-                elif step.op == "set":
-                    assert step.selector
-                    param = next((p for p in tool.params if p.selector == step.selector
-                                  or p.control_id == step.selector.lstrip("#")), None)
-                    step.detail = browser.set_value(step.selector, step.value,
-                                                    param.kind if param else "")
-                elif step.op == "set-label":
-                    assert step.selector
-                    step.detail = browser.set_by_label(step.selector, step.value, dialog)
-                elif step.op == "wait":
-                    assert step.selector
-                    browser.wait_visible(step.selector)
-                elif step.op == "wait-gone":
-                    assert step.selector
-                    browser.wait_gone(step.selector)
-                step.status = "done"
-            except cbr.BrowserError as exc:
-                if step.tolerate:
-                    step.status = "done"
-                    step.detail = f"{exc} — {step.tolerate}"
-                    result["host_going_down"] = True
-                    break
-                step.status = "failed"
-                step.detail = str(exc)
-                result["error"] = f"{step.op} {step.selector}: {exc}"
-                break
-
-        # A selector that matched several elements acted on the first one.
-        # That is right for a dialog rendered twice and wrong for the delete
-        # button of a table with four rows, and nothing here can tell the two
-        # apart — so the caller is told, and decides.
-        ambiguous = [f"{s.selector} matched {s.detail['matched']} elements"
-                     for s in steps if isinstance(s.detail, dict)
-                     and s.detail.get("matched", 1) > 1]
-        if ambiguous:
-            result["ambiguous"] = ambiguous
-
-        # the action happened if, and only if, the confirming button was
-        # pressed and nothing after it failed
-        attempted = [s for s in steps if s.status != "skipped"]
-        result["performed"] = (bool(attempted) and all(s.status == "done" for s in attempted)
-                               and any(s.op == "confirm" for s in attempted))
-
-        # whatever the page is complaining about is the best explanation of a
-        # failure there is — a dialog that refuses to close says why in it
-        with contextlib.suppress(cbr.BrowserError):
-            complaints = browser.errors(dialog if dialog and browser.is_visible(dialog) else None)
-            if complaints:
-                result["page_errors"] = complaints
-                result["performed"] = False
-        with contextlib.suppress(cbr.BrowserError):
-            if dialog and browser.is_visible(dialog):
-                result["dialog_still_open"] = True
-                result["dialog_text"] = browser.text(dialog)
-                # A confirming button that never enabled is the dialog asking
-                # for something nobody passed, so say what it is asking for:
-                # anything listed here and not in the schema can be supplied
-                # through `extra`.
-                fields = browser.fields(dialog)
-                if fields:
-                    result["dialog_fields"] = fields
-    except cbr.BrowserError as exc:
-        result["error"] = str(exc)
-        _drop_browser()
-
-    if CONFIG.screenshot_dir and (result.get("error") or result.get("page_errors")):
-        os.makedirs(CONFIG.screenshot_dir, exist_ok=True)
-        path = os.path.join(CONFIG.screenshot_dir, f"{tool.name}-{int(time.time())}.png")
-        if _BROWSER is not None:
-            result["screenshot"] = _BROWSER.screenshot(path)
-
-    # A host on its way down takes the browser's session with it; keeping the
-    # window would only mean the next call inherits a "Disconnected" curtain.
-    if result.get("host_going_down"):
-        _drop_browser()
-        result.pop("dialog_still_open", None)
-
-    # The browser outlives this call, so a dialog left standing by a failure
-    # would be in the way of the next one. Screenshot first, then clear it.
-    if result.get("dialog_still_open") and _BROWSER is not None:
-        with contextlib.suppress(cbr.BrowserError):
-            closed = _BROWSER.dismiss([(tool.selectors or {}).get("cancel", "")])
-            result["dialog_dismissed"] = closed or False
-
-    result["steps"] = [s.as_json() for s in steps]
-    return result
-
-
-# ==========================================================================
 # The MCP server
 # ==========================================================================
 
@@ -883,20 +453,20 @@ Work in this order:
      catalog is large, so search it rather than listing it.
   3. cockpit_describe_tool(name) — its inputs, with the current state of its
      page so you know which objects it can be aimed at.
-  4. cockpit_invoke(name, arguments) — perform it. This really changes the
-     host: the action is either sent straight to cockpit-bridge, exactly as
-     the page's own button would send it, or performed by driving the real UI
-     in a browser — cockpit_describe_tool says which, as backend. Pass
-     dry_run=true first to see what it would do; an action that deletes,
-     disables or restarts something additionally requires confirm=true.
+   4. cockpit_invoke(name, arguments) — perform it. This really changes the
+      host: the call is sent straight to cockpit-bridge, exactly as the page's
+      own button would send it. Only actions that this server has a recipe for
+      can be performed; for the rest cockpit_describe_tool says so (backend)
+      and cockpit_invoke reports that it cannot. Pass dry_run=true first to
+      see what it would do; an action that deletes, disables or restarts
+      something additionally requires confirm=true.
 
 An action that belongs to one of the objects a page lists — this account,
 that unit, that interface — needs to be told which one: pass at="mcptest",
 the name the page uses in its own URL. Inputs the catalog does not name go in
 extra, keyed by the caption the dialog puts next to them: that is where the
 password for a new account goes, and the shell, group name or similar that an
-action whose backend is the bridge asks for. If a dialog refuses to proceed,
-the result lists the fields it is showing as dialog_fields.
+action asks for.
 
 Every answer carries the state of the page it concerns. That state is read
 from the host, but it is a snapshot — call cockpit_refresh() after an action
@@ -1036,8 +606,9 @@ async def cockpit_search_tools(query: str = "", package: str | None = None,
     title="Describe a Cockpit action",
     description="One action in full: its JSON Schema of inputs, whether it is "
                 "destructive, the page it lives on and that page's current state "
-                "(the accounts, units, devices it can be aimed at), plus the steps "
-                "cockpit_invoke would perform in the UI.",
+                "(the accounts, units, devices it can be aimed at), whether it "
+                "can be done over this server's bridge, and — if it can — the "
+                "call cockpit_invoke would send.",
 )
 async def cockpit_describe_tool(name: str) -> dict[str, Any]:
     """
@@ -1056,31 +627,29 @@ async def cockpit_describe_tool(name: str) -> dict[str, Any]:
 @mcp.tool(
     title="Perform a Cockpit action",
     description="Perform an action from the catalog. THIS REALLY CHANGES THE HOST. "
-                "An action whose call is known is sent straight to cockpit-bridge, "
-                "exactly as its dialog would send it (cockpit_describe_tool reports "
-                "backend=bridge and the call); every other action is performed by "
-                "driving this host's Cockpit UI in a browser — open the page, open "
-                "its dialog, fill the inputs, press the button. Pass dry_run=true to "
-                "see what would be done without doing it. An action that deletes, "
-                "disables, restarts or otherwise disrupts something is refused "
-                "unless confirm=true is passed with it. If a dialog turns out to "
-                "want a field the catalog never recovered, the result lists what it "
-                "is showing as dialog_fields; pass those through `extra`, keyed by "
-                "the caption the dialog puts next to them — which is also how the "
-                "bridge is told a password, a shell or a new name.",
+                "The call is sent straight to cockpit-bridge, exactly as the action's "
+                "dialog would send it (cockpit_describe_tool reports backend=bridge "
+                "and the call); only actions with a bridge recipe can be performed, "
+                "and every other action in the catalog is reported as one that this "
+                "server cannot do. Pass dry_run=true to see what would be done "
+                "without doing it. An action that deletes, disables, restarts or "
+                "otherwise disrupts something is refused unless confirm=true is "
+                "passed with it; an action with a recipe that needs a field the "
+                "catalog does not name tells you which, and it is supplied through "
+                "`extra`, keyed by the caption the dialog puts next to it — which "
+                "is how the bridge is told a password, a shell or a new name.",
 )
 async def cockpit_invoke(name: str, arguments: dict[str, Any] | None = None,
                          dry_run: bool = False, confirm: bool = False,
                          extra: dict[str, Any] | None = None,
                          at: str | None = None,
-                         open_with: str | None = None,
                          backend: str = "auto") -> dict[str, Any]:
     """
     Args:
         name: the action to perform, as returned by cockpit_search_tools.
         arguments: its inputs, as described by cockpit_describe_tool.
         dry_run: report what would be done without doing it — over the bridge
-            the exact calls, in the browser the whole path up to Cancel.
+            the exact calls it would make.
         confirm: required for destructive actions; ignored for the others.
         extra: further inputs, keyed by their visible label rather than by a
             schema name — for the fields the scan did not recover, such as the
@@ -1088,16 +657,11 @@ async def cockpit_invoke(name: str, arguments: dict[str, Any] | None = None,
         at: which of the objects the page lists to act on, named the way the
             page addresses it in its hash — "mcptest" for an account,
             "sshd.service" for a unit, "ens4" for an interface. Required
-            whenever the action belongs to one object rather than to the page;
-            in the browser, without it the action is performed on whichever
-            object the page happens to be showing.
-        open_with: the selector of the control that opens this action's dialog,
-            for the actions whose opener the scan could not recover. The plan
-            in cockpit_describe_tool says when it is guessing one. Browser only.
-        backend: "auto" (the default: the bridge where there is a recipe for
-            the action, the browser otherwise), "bridge" (fail rather than
-            fall back — no browser is started), or "browser" (drive the real
-            UI, which is the way to check that an action's selectors still fit).
+            whenever the action belongs to one object rather than to the page.
+        backend: "auto" (the default) or "bridge"; both send the call over the
+            bridge, and this parameter is kept only so that an older client
+            that still passes it does not break. "browser" is no longer
+            supported.
     """
     cat = await catalog()
     tool = cat.by_name.get(name)
@@ -1111,78 +675,50 @@ async def cockpit_invoke(name: str, arguments: dict[str, Any] | None = None,
         return {"error": "the arguments do not fit this action", "problems": problems,
                 "inputSchema": tool.input_schema()}
 
-    if backend not in ("auto", "bridge", "browser"):
-        return {"error": f"backend must be auto, bridge or browser, not {backend!r}"}
+    if backend not in ("auto", "bridge"):
+        return {"error": f"backend must be \"auto\" or \"bridge\", not {backend!r} "
+                         f"(the browser path was removed; there is no UI to drive)"}
 
     notes: list[str] = []
     if CONFIG.read_only and not dry_run:
         dry_run = True
         notes.append("the server runs with --read-only, so this was a dry run")
 
-    # Which of the two performs it. An adapter that cannot build its calls
-    # from what was passed (no `at`, no password) is not an error: the browser
-    # needs no recipe, because it presses the real button.
-    calls: list[cbg.Call] | None = None
-    why_browser = ""                      # why this is not going over the bridge
+    # The bridge is the only way this server performs an action, so an adapter
+    # is required and its ability to build the calls is itself the plan.
+    if not CONFIG.use_bridge:
+        return {"error": "this server runs with --no-bridge, so it cannot "
+                         "perform any action", "performed": False,
+                "backend": "none"}
     adapter = cbg.adapter_for(name)
-    if backend == "browser":
-        why_browser = 'backend="browser" was asked for'
-    elif not CONFIG.use_bridge:
-        why_browser = "this server runs with --no-bridge"
-    elif adapter is None:
-        why_browser = f"there is no bridge recipe for {name}"
-        if backend == "bridge":
-            return {"error": f"{why_browser}; it can only be performed in the "
-                             f"browser (backend=\"browser\")", "performed": False}
-    else:
-        try:
-            calls = cbg.plan(name, arguments, extra, at)
-        except cbg.Unsupported as exc:
-            why_browser = f"the bridge has a recipe for {name} but could not use it ({exc})"
-            if backend == "bridge":
-                return {"error": str(exc), "performed": False,
-                        "bridge_call": adapter.summary}
-            notes.append(f"{why_browser}, so this went to the browser")
+    if adapter is None:
+        return {"error": f"there is no bridge recipe for {name!r}, and this "
+                         "server has no other way to perform it",
+                "performed": False, "backend": "none"}
+    try:
+        calls = cbg.plan(name, arguments, extra, at)
+    except cbg.Unsupported as exc:
+        return {"error": f"the bridge has a recipe for {name} but could not build "
+                         f"it from what was passed: {exc}",
+                "performed": False, "backend": "bridge",
+                "bridge_call": adapter.summary}
 
     if needs_confirm(tool) and not confirm and not dry_run:
-        plan = ([c.as_json() for c in calls] if calls else
-                [s.as_json() for s in plan_steps(tool, arguments, False, extra, at, open_with)])
         return {
             "error": f"{name} changes or destroys something and needs confirm=true",
             "would_do": tool.title,
-            "backend": "bridge" if calls else "browser",
+            "backend": "bridge",
             "state": _state(tool.context),
-            "plan": plan,
+            "plan": [c.as_json() for c in calls],
             "performed": False,
         }
 
     async with _DRIVE_LOCK:
-        result: dict[str, Any] | None = None
-        if calls is not None:
-            try:
-                result = await asyncio.to_thread(cbg.BRIDGE.perform, calls, dry_run)
-            except cbg.BridgeError as exc:
-                # Raised while opening the session or asking for root, which
-                # is before any of the calls ran — so falling back performs
-                # the action once, not twice.
-                if backend == "bridge" or not CONFIG.use_browser:
-                    result = {"performed": False, "backend": "bridge", "error": str(exc)}
-                else:
-                    why_browser = f"the bridge was not available ({exc})"
-                    notes.append(f"{why_browser}, so this went to the browser")
-                    calls = None
-        if result is None:
-            if not CONFIG.use_browser:
-                refused: dict[str, Any] = {
-                    "error": f"this server runs with --no-browser, and {why_browser}",
-                    "performed": False}
-                if adapter is not None:
-                    refused["bridge_call"] = adapter.summary
-                return refused
-            steps = plan_steps(tool, arguments, dry_run, extra, at, open_with)
-            result = await asyncio.to_thread(run_steps, tool, steps)
-        if result.get("performed") and ends_session(name, arguments, extra, at):
-            result["host_going_down"] = True
+        result: dict[str, Any]
+        try:
+            result = await asyncio.to_thread(cbg.BRIDGE.perform, calls, dry_run)
+        except cbg.BridgeError as exc:
+            result = {"performed": False, "backend": "bridge", "error": str(exc)}
 
         # the action changed the host; the state everything else reports must
         # not keep describing the host as it was before it
@@ -1199,7 +735,7 @@ async def cockpit_invoke(name: str, arguments: dict[str, Any] | None = None,
     if carried:
         notes.insert(0, carried)
     result.update({"tool": name, "title": tool.title, "dry_run": dry_run,
-                   "arguments": arguments})
+                   "arguments": arguments, "backend": "bridge"})
     # A host on its way down has a state, and it is the one from before the
     # call: four days of uptime printed under a reboot that just succeeded.
     # Better to say there is nothing to report than to report that.
@@ -1298,10 +834,9 @@ async def page_resource(package: str, path: str) -> str:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Serve a running Cockpit host over the Model Context Protocol: "
-                    "its live state, the actions its UI offers, and a browser that "
-                    "performs them.",
-        epilog="Environment: COCKPIT_USER, COCKPIT_PASSWORD, COCKPIT_MCP_LIVE_TTL, "
-               "COCKPIT_MCP_WAIT_TIMEOUT")
+                    "its live state, the actions its UI offers, and the bridge calls "
+                    "that perform them.",
+        epilog="Environment: COCKPIT_USER, COCKPIT_PASSWORD, COCKPIT_MCP_LIVE_TTL")
     parser.add_argument("target", nargs="?", default=None,
                         metavar="[SCHEME://]HOST[:PORT]",
                         help=f"the Cockpit server to serve (default: {clt.DEFAULT_TARGET})")
@@ -1312,18 +847,9 @@ def main(argv: list[str] | None = None) -> int:
                         help="do not verify the server's TLS certificate")
     parser.add_argument("--read-only", action="store_true",
                         help="never perform an action: every invocation is a dry run")
-    parser.add_argument("--browser", metavar="PATH",
-                        help="the chromium binary to drive (default: the first one found)")
     parser.add_argument("--no-bridge", action="store_true",
-                        help="never perform an action over the bridge: drive the UI "
-                             "for all of them")
-    parser.add_argument("--no-browser", action="store_true",
-                        help="never start a browser: only the actions cockpit_bridge "
-                             "has a recipe for can be performed")
-    parser.add_argument("--headful", action="store_true",
-                        help="show the browser window instead of running it headless")
-    parser.add_argument("--screenshot-dir", metavar="DIR",
-                        help="save a screenshot here whenever an action fails")
+                        help="never perform an action over the bridge: describe "
+                             "them, but refuse to do any of them")
     parser.add_argument("--prefetch", action="store_true",
                         help="scan the host at startup instead of on the first call")
     parser.add_argument("--transport", default="stdio",
@@ -1344,15 +870,8 @@ def main(argv: list[str] | None = None) -> int:
     CONFIG.user, CONFIG.password = user, password
     CONFIG.packages = args.package
     CONFIG.insecure = args.insecure
-    CONFIG.browser = args.browser
-    CONFIG.headless = not args.headful
     CONFIG.read_only = args.read_only
-    CONFIG.screenshot_dir = args.screenshot_dir
     CONFIG.use_bridge = not args.no_bridge
-    CONFIG.use_browser = not args.no_browser
-    if args.no_bridge and args.no_browser:
-        parser.error("--no-bridge and --no-browser together leave nothing that "
-                     "can perform an action; --read-only is what you want")
     CONFIG.apply()
 
     if args.prefetch:
@@ -1366,7 +885,6 @@ def main(argv: list[str] | None = None) -> int:
         else:
             mcp.run(args.transport)
     finally:
-        _drop_browser()
         cbg.BRIDGE.close()
     return 0
 
@@ -1375,6 +893,5 @@ if __name__ == "__main__":
     try:
         raise SystemExit(main())
     except KeyboardInterrupt:
-        _drop_browser()
         cbg.BRIDGE.close()
         raise SystemExit(130) from None
