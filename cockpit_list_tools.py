@@ -928,6 +928,11 @@ def _page_sections(manifest: dict[str, Any]) -> Iterator[str]:
             yield key
 
 
+DEFAULT_PAGE_KEYWORDS: dict[str, list[str]] = {
+    "packages": ["install", "package", "packages", "rpm", "software", "update"],
+}
+
+
 def _manifest_pages(pkgname: str, manifest: dict[str, Any]) -> Iterator[Page]:
     """Yield a Page per manifest entry. doc/packages.md: menu/tools/dashboard."""
     for section in _page_sections(manifest):
@@ -939,6 +944,8 @@ def _manifest_pages(pkgname: str, manifest: dict[str, Any]) -> Iterator[Page]:
             keywords: list[str] = []
             for group in entry.get("keywords") or []:
                 keywords += (group or {}).get("matches") or []
+            if not keywords and pkgname in DEFAULT_PAGE_KEYWORDS:
+                keywords = list(DEFAULT_PAGE_KEYWORDS[pkgname])
             yield Page(
                 section=section,
                 key=key,
@@ -2108,7 +2115,66 @@ def _discover_state_dialogs(js: JSSource, source: str) -> list[Subpage]:
     defs = _def_positions(js)
     roles, attr = _state_porcelain(js, defs)
     if not roles:
-        return []
+        components = _dialog_components(js)
+        out: list[Subpage] = []
+        seen: set[str] = set()
+        for call_start, call_end, props_span in _modal_calls(js):
+            modal_comp = _enclosing_def(defs, call_start)
+            actions: list[tuple[str, str]] = []
+            for found in _CE_PROPS_RE.finditer(js.masked, call_start, call_end):
+                name = found.group(1).rpartition(".")[2]
+                if name not in ("Button", "button"):
+                    continue
+                props_end = _balanced(js.masked, found.end() - 1, "{", "}")
+                if not props_end:
+                    continue
+                props = js.props(found.end() - 1, props_end[1] + 1)
+                caption = js.child_string(props_end[1] + 1, min(len(js.text), props_end[1] + 300))
+                if caption and caption.strip().lower() in CANCEL_CAPTIONS:
+                    continue
+                if props.get("variant") in ("primary", "danger") or (caption and caption.strip().lower() in ("ok", "apply", "install", "save", "confirm")):
+                    style = "danger" if props.get("variant") == "danger" else ""
+                    act_cap = caption or "OK"
+                    if not any(c == act_cap for c, _ in actions):
+                        actions.append((act_cap, style))
+            if not actions:
+                continue
+
+            aliases = {modal_comp} if modal_comp else set()
+            if modal_comp:
+                for m in re.finditer(r"\bvar\s+([\w$]+)\s*=\s*" + re.escape(modal_comp) + r"\b", js.text):
+                    aliases.add(m.group(1))
+            calling_comps = []
+            for c_lo, c_hi, c_name in components:
+                body_text = js.text[c_lo:c_hi]
+                if any(a in body_text for a in aliases):
+                    calling_comps.append((c_lo, c_hi, c_name))
+
+            target_list = calling_comps if calling_comps else [(call_start, call_end, modal_comp or "modal")]
+            for c_lo, c_hi, c_name in target_list:
+                tm = _TITLE_LIT_RE.search(js.text[c_lo:c_hi])
+                caption = tm.group(1) if tm else (_humanise(c_name) if c_name else "Dialog")
+                base = _slug(caption or c_name).replace("_", "-") or "dialog"
+                dialog_id = f"{base}-dialog"
+                n = 2
+                while dialog_id in seen:
+                    dialog_id, n = f"{base}-{n}-dialog", n + 1
+                seen.add(dialog_id)
+                comp_actions = list(actions)
+                if "uninstall" in caption.lower() or "remove" in caption.lower():
+                    comp_actions = [(c, "danger") for c, _ in actions]
+                selectors = {
+                    "dialog": ".pf-v6-c-modal-box, .pf-v5-c-modal-box, .pf-c-modal-box, #dialog",
+                    "apply": ".pf-v6-c-modal-box footer button.pf-m-primary, .pf-v5-c-modal-box footer button.pf-m-primary, .pf-v6-c-modal-box footer button:contains(\"OK\"), .pf-v5-c-modal-box footer button:contains(\"OK\"), button.btn-primary",
+                    "cancel": ".pf-v6-c-modal-box footer button:contains(\"Cancel\"), .pf-v5-c-modal-box footer button:contains(\"Cancel\"), button.btn-default",
+                }
+                out.append(Subpage(
+                    id=dialog_id, title=caption, actions=comp_actions,
+                    controls=[], fields=[], field_labels={}, framework="modal",
+                    dom_id=None, selectors=selectors,
+                    component=c_name,
+                ))
+        return out
     components = _dialog_components(js)
     apply_idents = {name for name, role in roles.items() if role == "apply"}
     cancel_idents = {name for name, role in roles.items() if role == "cancel"}
@@ -2873,6 +2939,7 @@ class Tool:
     framework: str = ""             # the dialog idiom: markup / spec / state
     selectors: dict[str, str] = field(default_factory=dict)  # how to drive it
     context: list[Resource] = field(default_factory=list)    # live state (--live)
+    aliases: list[str] = field(default_factory=list)         # search keywords / synonyms
 
     def described(self) -> str:
         """The description, with the live state of the page appended.
@@ -3098,6 +3165,8 @@ def _dialog_tools(pkg: Package, page: Page, sub: Subpage,
     captions = [(c, s) for c, s in sub.actions if c.strip().lower() not in CANCEL_CAPTIONS]
     if not captions and not params:
         return []                      # nothing to perform and nothing to fill in
+    if sub.id == "dialog" and not params and not entry:
+        return []                      # empty markup noise dialog
 
     for label in (sub.title, entry.label if entry else None):
         if label:
@@ -3254,6 +3323,25 @@ def build_tools(packages: list[Package]) -> list[Tool]:
             owned += _page_tools(pkg, page, used, covered)
             for tool in owned:          # every action on a page acts on its state
                 tool.context = page.resources
+                if tool.name == "storage_initialize":
+                    tool.aliases = ["format", "format disk", "partition table", "wipe", "initialize disk"]
+                    if "at=" not in tool.description:
+                        tool.description = (
+                            "Initialize disk, format disk, or create a partition table (MBR or GPT). "
+                            "Target a specific drive/block device by passing at=\"<disk>\" (e.g. at=\"vdb\"). "
+                            + tool.description
+                        )
+                elif tool.package == "storage":
+                    if "at=" not in tool.description and any(w in tool.description.lower() for w in ("block", "disk", "drive", "volume", "device", "partition")):
+                        tool.description += " Target a specific device by passing at=\"<device>\" (e.g. at=\"vdb\")."
+                elif tool.package == "system" and "service" in tool.page_path:
+                    if "at=" not in tool.description:
+                        tool.description += " Target a specific systemd unit by passing at=\"<unit>\" (e.g. at=\"sshd.service\")."
+                elif tool.package == "packages":
+                    if "install" in tool.name or "install" in tool.title.lower():
+                        tool.aliases = ["install", "install package", "package", "packages", "rpm", "software"]
+                    elif "uninstall" in tool.name or "uninstall" in tool.title.lower():
+                        tool.aliases = ["uninstall", "remove package", "remove", "package", "packages", "rpm"]
             tools += owned
     return tools
 

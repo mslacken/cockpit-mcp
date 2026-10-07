@@ -249,6 +249,10 @@ class Catalog:
                 cookie, _ = clt.connect()
                 clt.probe_live(packages, cookie)
         tools = clt.build_tools(packages) + missed_tools(packages)
+        for tool in tools:
+            fix = UI_FIXUPS.get(tool.name)
+            if fix and fix.params and not tool.params:
+                tool.params = list(fix.params)
 
         self.cookie = cookie
         self.packages = packages
@@ -468,6 +472,7 @@ class Fixup:
     fill: Any = None                                # (cbg.Request) -> [Step]
     # True when performing this leaves no page behind to confirm it with.
     ends_session: Any = None                        # (cbg.Request) -> bool
+    params: list[clt.ToolParam] = field(default_factory=list)
 
 
 # The Delay select offers these and nothing else (cockpit-components-shutdown
@@ -475,6 +480,22 @@ class Fixup:
 # delay straight to shutdown(1).
 _DELAY_OPTIONS = {"+0": "No delay", "+1": "1 minute", "+5": "5 minutes",
                   "+20": "20 minutes", "+40": "40 minutes", "+60": "60 minutes"}
+
+_SHUTDOWN_PARAMS = [
+    clt.ToolParam(
+        name="delay",
+        type="string",
+        description="When to perform the action (e.g. '+0' or 'now', '+1', '+5', '+20', '+40', '+60')",
+        required=False,
+        choices=list(_DELAY_OPTIONS.items()) + [("now", "No delay")],
+    ),
+    clt.ToolParam(
+        name="message",
+        type="string",
+        description="Warning message broadcast to logged-in users",
+        required=False,
+    ),
+]
 
 
 def _fill_shutdown_dialog(req: cbg.Request) -> list[cbr.Step]:
@@ -530,6 +551,7 @@ _SHUTDOWN_DIALOG = {
     "confirm": "#shutdown-dialog button.pf-m-danger",
     "fill": _fill_shutdown_dialog,
     "ends_session": _immediately,
+    "params": _SHUTDOWN_PARAMS,
 }
 
 UI_FIXUPS: dict[str, Fixup] = {
@@ -555,6 +577,16 @@ UI_FIXUPS: dict[str, Fixup] = {
         why="\"Shut down\" is #shutdown-dialog's own confirming button; the "
             "menu item that opens that dialog is #shutdown",
         **_SHUTDOWN_DIALOG),
+    "storage_initialize": Fixup(
+        open=[
+            ".pf-v6-c-card .pf-v6-c-menu-toggle, .pf-v5-c-card .pf-v5-c-menu-toggle",
+            'button:contains("Create partition table"), .pf-v6-c-menu__item:contains("Create partition table"), .pf-v5-c-menu__item:contains("Create partition table")',
+        ],
+        dialog="#dialog",
+        action="Initialize",
+        confirm="#dialog button.pf-m-danger, #dialog button.btn-danger",
+        why="the opener is inside the drive card kebab menu as 'Create partition table'",
+    ),
 }
 
 
@@ -605,22 +637,21 @@ def plan_steps(tool: clt.Tool, arguments: dict[str, Any], dry_run: bool,
     if dialog:
         steps.append(cbr.Step("wait", selector=dialog, detail="the dialog is up"))
 
-    for param in tool.params:
-        if param.name not in arguments:
-            continue
-        selector = param.selector or (f"#{param.control_id}" if param.control_id else None)
-        if not selector:
-            steps.append(cbr.Step("set", value=arguments[param.name], status="skipped",
-                                  detail=f"no selector was recovered for {param.name!r}"))
-            continue
-        steps.append(cbr.Step("set", selector=selector, value=arguments[param.name],
-                              detail=param.kind or None))
-
     if fix and fix.fill:
         # This dialog's fields are written out by hand, so `extra` is read by
         # the fixup rather than guessed at by caption.
         steps += fix.fill(req)
     else:
+        for param in tool.params:
+            if param.name not in arguments:
+                continue
+            selector = param.selector or (f"#{param.control_id}" if param.control_id else None)
+            if not selector:
+                steps.append(cbr.Step("set", value=arguments[param.name], status="skipped",
+                                      detail=f"no selector was recovered for {param.name!r}"))
+                continue
+            steps.append(cbr.Step("set", selector=selector, value=arguments[param.name],
+                                  detail=param.kind or None))
         # Fields the scan never recovered. The create-account dialog's two
         # password boxes are the standing example: they are built by a shared
         # React component, so no selector for them survives into the bundle's
@@ -969,14 +1000,19 @@ async def cockpit_search_tools(query: str = "", package: str | None = None,
             continue
         if destructive_only and not needs_confirm(tool):
             continue
+        pkg_page = cat.page_for(tool)
+        page_kw = " ".join(pkg_page[1].keywords).lower() if pkg_page else ""
+        tool_aliases = " ".join(getattr(tool, "aliases", [])).lower()
+        context_text = " ".join(r.line() for r in tool.context).lower() if tool.context else ""
         haystacks = (tool.name.lower().replace("_", " "), tool.title.lower(),
                      tool.page_label.lower(), tool.description.lower(),
-                     " ".join(p.name for p in tool.params).lower())
+                     " ".join(p.name for p in tool.params).lower(),
+                     tool_aliases, page_kw, context_text)
         # a word in the name or title says more than the same word buried in
         # the description, so hits are ranked by where they landed
         score = 0
         for word in words:
-            weights = (8, 6, 3, 1, 2)
+            weights = (8, 6, 3, 1, 2, 6, 4, 3)
             found = [w for w, hay in zip(weights, haystacks) if word in hay]
             if not found:
                 score = -1

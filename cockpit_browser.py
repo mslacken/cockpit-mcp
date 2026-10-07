@@ -100,13 +100,51 @@ HELPER_JS = r"""
   const visible = el => !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length);
 
   // ":contains(text)", the one Sizzle extension Cockpit's selectors use.
-  function selectAll(sel) {
-    const m = /:contains\((?:'([^']*)'|"([^"]*)"|([^)]*))\)/.exec(sel);
-    if (!m) return Array.from(document.querySelectorAll(sel));
+  function splitClauses(sel) {
+    const clauses = [];
+    let cur = "", inParen = 0, inQuote = false, qChar = "";
+    for (let i = 0; i < sel.length; i++) {
+      const c = sel[i];
+      if (inQuote) {
+        cur += c;
+        if (c === qChar) inQuote = false;
+      } else if (c === "'" || c === '"') {
+        cur += c; inQuote = true; qChar = c;
+      } else if (c === "(") {
+        cur += c; inParen++;
+      } else if (c === ")") {
+        cur += c; if (inParen > 0) inParen--;
+      } else if (c === "," && inParen === 0) {
+        if (cur.trim()) clauses.push(cur.trim());
+        cur = "";
+      } else {
+        cur += c;
+      }
+    }
+    if (cur.trim()) clauses.push(cur.trim());
+    return clauses;
+  }
+
+  function selectClause(clause) {
+    const m = /:contains\((?:'([^']*)'|"([^"]*)"|([^)]*))\)/.exec(clause);
+    if (!m) return Array.from(document.querySelectorAll(clause));
     const text = (m[1] ?? m[2] ?? m[3] ?? "").trim();
-    const base = sel.replace(m[0], "").trim() || "*";
+    const base = clause.replace(m[0], "").trim() || "*";
     return Array.from(document.querySelectorAll(base))
                 .filter(el => (el.innerText || el.textContent || "").includes(text));
+  }
+
+  function selectAll(sel) {
+    const clauses = splitClauses(sel);
+    if (clauses.length <= 1 && !/:contains\(/.test(sel))
+      return Array.from(document.querySelectorAll(sel));
+    const results = [];
+    for (const clause of clauses) {
+      for (const el of selectClause(clause)) {
+        if (!results.includes(el)) results.push(el);
+      }
+    }
+    return results;
   }
 
   function find(sel) {
@@ -148,6 +186,10 @@ HELPER_JS = r"""
   // Write a value into whatever kind of control this element turns out to be.
   // "kind" is the catalog's guess and only breaks ties; the DOM decides.
   function setOn(el, value, kind, sel) {
+    if (el.tagName !== "SELECT" && el.tagName !== "INPUT" && el.tagName !== "TEXTAREA") {
+      const child = el.querySelector("select, input, textarea, button, [role=button], [role=combobox]");
+      if (child) el = child;
+    }
     const box = el.type === "checkbox" || el.type === "radio" ||
                 el.getAttribute("role") === "switch";
     if (box || kind === "checkbox" || kind === "switch" || kind === "radio") {
