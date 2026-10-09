@@ -77,6 +77,7 @@ import re
 import shutil
 import subprocess
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -622,7 +623,9 @@ def fetch_bundles(target: str,
     af = clt.AssetFetcher(cookie)
     os.makedirs(into_dir, exist_ok=True)
     host = clt.MANIFEST_HOST
-    out: list[str] = []
+    # De-duplicate the asset list up front (deterministic, in the main thread);
+    # the fetch+write below can then run on a pool sharing the keep-alive conn.
+    jobs: list[tuple[str, str]] = []       # (url, out_path)
     seen: set[str] = set()
     for pkg in pkgs:
         for page in pkg.pages:
@@ -632,12 +635,28 @@ def fetch_bundles(target: str,
                 if p in seen or not p.endswith(".js"):
                     continue
                 seen.add(p)
-                body = af.text(p)
-                if not body or body.lstrip().startswith("<!DOCTYPE"):
-                    continue
-                fn = os.path.join(into_dir, "LIVE_" + p.replace("/", "__"))
-                with open(fn, "w", encoding="utf-8") as fh:
-                    fh.write(body)
+                jobs.append((p, os.path.join(into_dir, "LIVE_" + p.replace("/", "__"))))
+
+    def _fetch_write(job: tuple[str, str]) -> str | None:
+        url, fn = job
+        body = af.text(url)
+        if not body or body.lstrip().startswith("<!DOCTYPE"):
+            return None
+        with open(fn, "w", encoding="utf-8") as fh:
+            fh.write(body)
+        return fn
+
+    out: list[str] = []
+    if len(jobs) > 1:
+        workers = int(os.environ.get("COCKPIT_FETCH_WORKERS", "8"))
+        with ThreadPoolExecutor(max_workers=max(1, workers)) as ex:
+            for result in ex.map(_fetch_write, jobs):
+                if result is not None:
+                    out.append(result)
+    else:
+        for job in jobs:
+            fn = _fetch_write(job)
+            if fn is not None:
                 out.append(fn)
     return out
 

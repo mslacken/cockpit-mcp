@@ -210,7 +210,9 @@ import string
 import struct
 import sys
 import textwrap
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Any, BinaryIO, Iterator
 
@@ -289,27 +291,96 @@ def _tls_context() -> ssl.SSLContext | None:
     return ctx
 
 
+_POOL_MAX = max(1, int(os.environ.get("COCKPIT_POOL_MAX", "16")))
+_pool_lock = threading.Lock()
+_pool: list[http.client.HTTPConnection] = []
+_pool_key: str | None = None
+
+
+def _new_conn() -> http.client.HTTPConnection:
+    if USE_TLS:
+        return http.client.HTTPSConnection(HOST, PORT, timeout=TIMEOUT, context=_tls_context())
+    return http.client.HTTPConnection(HOST, PORT, timeout=TIMEOUT)
+
+
+def _pool_clear(key: str | None) -> None:
+    """Discard pooled connections and set the pool key. Call with _pool_lock held."""
+    global _pool, _pool_key
+    for c in _pool:
+        with contextlib.suppress(Exception):
+            c.close()
+    _pool = []
+    _pool_key = key
+
+
+def _reset_pool() -> None:
+    """Discard pooled connections (e.g. after set_target() re-points us)."""
+    with _pool_lock:
+        _pool_clear(None)
+
+
+def _acquire_conn() -> http.client.HTTPConnection:
+    """Hand out a keep-alive connection to (HOST, PORT).
+
+    An idle pooled connection (``isready`` is False, socket still open) is
+    returned as-is so the established TLS session is reused — no new handshake.
+    The pool is keyed on the destination so a pooled socket is never reused
+    after set_target() repoints us (stale socket → broken handshake). If the
+    server has closed it, http_get's single retry rebuilds the connection.
+    """
+    global _pool
+    key = f"{HOST}:{PORT}:{USE_TLS}"
+    with _pool_lock:
+        if _pool_key != key:
+            _pool_clear(key)
+        live = []
+        for c in _pool:
+            if c.sock is None:             # server closed it → discard
+                with contextlib.suppress(Exception):
+                    c.close()
+            else:
+                live.append(c)             # socket open → reusable
+        _pool = live
+        if live:
+            return live.pop(0)             # reuse the established TLS session
+        return _new_conn()
+
+
+def _release_conn(conn: http.client.HTTPConnection, reusable: bool) -> None:
+    with _pool_lock:
+        if reusable and _pool_key == f"{HOST}:{PORT}:{USE_TLS}" and len(_pool) < _POOL_MAX:
+            _pool.append(conn)
+            return
+        with contextlib.suppress(Exception):
+            conn.close()
+
+
 def http_get(path: str, headers: dict[str, str]) -> tuple[http.client.HTTPResponse, bytes]:
     """Small blocking HTTP client. Returns the response (for status/headers) and its body.
 
-    Cockpit serves pre-compressed assets (packages.py keeps ``foo.js.gz`` on
-    disk and answers a request for ``foo.js`` with Content-Encoding: gzip), and
+    Reuses a pooled TLS connection when the target is unchanged (one handshake
+    instead of one per request; safe to call from a thread pool because
+    _acquire_conn hands each worker its own connection — the pool is mutex-guarded).
+    Cockpit serves pre-compressed assets (packages.py keeps ``foo.js.gz`` on disk
+    and answers a request for ``foo.js`` with Content-Encoding: gzip), and
     http.client does not decode that for us.
     """
-    conn: http.client.HTTPConnection = (
-        http.client.HTTPSConnection(HOST, PORT, timeout=TIMEOUT, context=_tls_context())
-        if USE_TLS else http.client.HTTPConnection(HOST, PORT, timeout=TIMEOUT))
-    try:
-        conn.request("GET", path, headers={**headers, "Accept-Encoding": "gzip",
-                                           "Connection": "close"})
-        resp = conn.getresponse()
-        body = resp.read()
-        if (resp.getheader("Content-Encoding") or "").lower() == "gzip" and body:
-            with contextlib.suppress(OSError, EOFError):
-                body = gzip.decompress(body)
-        return resp, body
-    finally:
-        conn.close()
+    last_exc: Exception | None = None
+    for attempt in (0, 1):
+        conn = _acquire_conn()
+        try:
+            conn.request("GET", path, headers={**headers, "Accept-Encoding": "gzip"})
+            resp = conn.getresponse()
+            body = resp.read()
+            if (resp.getheader("Content-Encoding") or "").lower() == "gzip" and body:
+                with contextlib.suppress(OSError, EOFError):
+                    body = gzip.decompress(body)
+            _release_conn(conn, resp.will_close is False)
+            return resp, body
+        except (OSError, http.client.HTTPException) as exc:
+            last_exc = exc
+            _release_conn(conn, False)
+    raise last_exc  # type: ignore[misc]
 
 
 def do_login(user: str, password: str) -> str:
@@ -341,31 +412,41 @@ def fetch_manifests(cookie: str) -> dict[str, Any]:
 
 
 class AssetFetcher:
-    """Fetches package files over HTTP, caching by path (bundles are shared)."""
+    """Fetches package files over HTTP, caching by path (bundles are shared).
+
+    Thread-safe: .text() may be called concurrently from a thread pool. A lock
+    guards the cache and the fetched/bytes counters (a dict ``x += 1`` is not
+    atomic). Concurrent misses for the same path may issue two GETs — cheaply
+    redundant rather than wrong.
+    """
 
     def __init__(self, cookie: str) -> None:
         self.cookie = cookie
         self._cache: dict[str, str | None] = {}
+        self._lock = threading.Lock()
         self.fetched = 0
         self.bytes = 0
 
     def text(self, path: str) -> str | None:
         """GET a package file as text. None if it is missing or unreadable."""
-        if path in self._cache:
-            return self._cache[path]
+        with self._lock:
+            if path in self._cache:
+                return self._cache[path]
         body: str | None = None
         try:
             resp, raw = http_get(path, {"Cookie": self.cookie})
             if resp.status == 200:
                 body = raw.decode("utf-8", "replace")
-                self.fetched += 1
-                self.bytes += len(raw)
             else:
                 log(f"   (skip) GET {path}: HTTP {resp.status}")
         except (OSError, RuntimeError) as exc:
             log(f"   (skip) GET {path}: {exc}")
-        self._cache[path] = body
-        return body
+        with self._lock:
+            if body is not None:
+                self.fetched += 1
+                self.bytes += len(raw)
+            self._cache[path] = body
+            return self._cache[path]
 
 
 # --------------------------------------------------------------------------
@@ -2430,14 +2511,15 @@ def introspect_page(pkg: str, page: Page, assets: AssetFetcher) -> None:
 
 def introspect(packages: list[Package], cookie: str) -> None:
     assets = AssetFetcher(cookie)
-    total = sum(len(p.pages) for p in packages)
-    log(f"introspecting {total} page(s) for buttons and inputs")
-    done = 0
-    for pkg in packages:
-        for page in pkg.pages:
-            done += 1
-            introspect_page(pkg.name, page, assets)
-            log(f"   [{done}/{total}] {pkg.name}/{page.path}: {len(page.controls)} control(s)")
+    pages = [(pkg, page) for pkg in packages for page in pkg.pages]
+    total = len(pages)
+    workers = min(_POOL_MAX, max(1, total))
+    log(f"introspecting {total} page(s) for buttons and inputs ({workers} workers)")
+    if total:
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            list(ex.map(lambda t: introspect_page(t[0].name, t[1], assets), pages))
+        for pkg, page in pages:
+            log(f"   {pkg.name}/{page.path}: {len(page.controls)} control(s)")
     log(f"   fetched {assets.fetched} file(s), {assets.bytes / 1024:.0f} KiB")
 
 
