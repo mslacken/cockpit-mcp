@@ -48,6 +48,10 @@ WHAT THE MCP LAYER ADDS
 Over a CLI for one-shot use, an MCP surface (when the `mcp` SDK is
 importable):
 
+    cockpit_server(target)               connect: user/password via the
+                                         COCKPIT_USER / COCKPIT_PASSWORD
+                                         environment (or a tty prompt), then
+                                         fetch + parse that host's bundles
     cockpit_overview()                   host, bundles, record counts
     cockpit_parse(bundles…)              parse now, in process
     cockpit_records(kind, substring)     search the records
@@ -77,6 +81,7 @@ import os
 import re
 import shlex
 import shutil
+import socket
 import subprocess
 import tempfile
 import sys
@@ -1078,12 +1083,117 @@ def _state_brief(records: list[Record] | None = None,
             for r in pool[:limit]]
 
 
+def _resolve_port(target: str) -> int:
+    """The port of a [schema://]host[:port] target (Cockpit's 9090 by default)."""
+    rest = target.split("://", 1)[-1].rsplit("/", 1)[0]
+    if rest.startswith("["):                       # IPv6 literal
+        rest = rest[1:]
+    host, _, port = rest.rpartition(":")
+    if port.isdigit():
+        return int(port)
+    return 9090
+
+
+def _target_display(target: str) -> str:
+    """Render the target with its resolved IP address, e.g.
+    ``myhost.example.org (9090, 198.51.100.7)`` or, when the target already
+    is an address, ``10.0.0.4 (9090)`` — so it is clear which host the MCP
+    server is connected to."""
+    rest = target.split("://", 1)[-1].rsplit("/", 1)[0]
+    if rest.startswith("["):                       # IPv6 literal
+        host = rest[1:].split("]", 1)[0]
+    elif ":" in rest:
+        host = rest.rpartition(":")[0]
+    else:
+        host = rest
+    try:
+        infos = socket.getaddrinfo(host, None, type=socket.SOCK_STREAM)
+        addr = next((i[4][0] for i in infos), None)
+    except OSError:
+        addr = None
+    port = _resolve_port(target)
+    if addr and addr != host:                      # name with a different IP
+        return "%s (%d, %s)" % (host, port, addr)
+    if addr:                                       # the target is the IP
+        return "%s (%d)" % (host, port)
+    return "%s (%d, could not resolve %s)" % (host, port, host)
+
+
+def _mcp_instructions() -> str:
+    """The MCP server description: it names the Cockpit host the server is
+    connected to, with that host's resolved IP address, so the client can
+    tell which machine is being addressed."""
+    return ("Cockpit host %s exposed over MCP.  Work in order: "
+            "cockpit_overview → cockpit_parse → cockpit_records → "
+            "cockpit_describe_record → cockpit_invoke."
+            % _target_display(NG_CONFIG.target))
+
+
 if MCP_AVAILABLE and FastMCP is not None:
-    mcp = FastMCP(
-        "cockpit",
-        instructions=("Cockpit host exposed over MCP.  Work in order: "
-                      "cockpit_overview → cockpit_parse → cockpit_records → "
-                      "cockpit_describe_record → cockpit_invoke."))
+    mcp = FastMCP("cockpit", )
+
+    @mcp.tool(title="Connect to a Cockpit host",
+              description="Point the server at a Cockpit host: credentials are "
+                          "read from COCKPIT_USER and COCKPIT_PASSWORD (a "
+                          "tty prompt otherwise) — pass them as arguments in "
+                          "that order. Then fetches every page bundle and "
+                          "parses it, so cockpit_records/… work on that host. "
+                          "The server also starts fine without a host: call "
+                          "this first, or pass local bundles to "
+                          "cockpit_parse.")
+    async def cockpit_server(target: str | None = None,
+                             user: str | None = None,
+                             password: str | None = None,
+                             fetch: bool = True) -> dict[str, Any]:
+        if clt is None:
+            return {"error": "cannot connect: cockpit_list_tools missing"}
+        if fetch and (not user or not password):
+            return {"error": "pass user and password (or fetch=false after "
+                              "COCKPIT_USER / COCKPIT_PASSWORD are set)"}
+        previous = (NG_CONFIG.target, NG_CONFIG.user)
+        NG_CONFIG.target = target or NG_CONFIG.target
+        if user:
+            NG_CONFIG.user = user
+        if password:
+            NG_CONFIG.password = password
+        resolved_user = user or os.environ.get("COCKPIT_USER") \
+            or NG_CONFIG.user or getpass.getuser()
+        if not (password or os.environ.get("COCKPIT_PASSWORD")
+                or NG_CONFIG.password) and sys.stdin.isatty():
+            password = getpass.getpass(
+                "Cockpit password for %s: " % resolved_user)
+            NG_CONFIG.password = password
+        NG_CONFIG.user = resolved_user
+        if (NG_CONFIG.target, resolved_user) != previous:
+            # A new host or user: the cached root session and the parsed
+            # bundles both belong to the old one, so drop them.
+            if cbg is not None:
+                cbg.BRIDGE.close()
+            NG_CONFIG.bundles = []
+            _reset_records()
+        out: dict[str, Any] = {"connected": True, "target": NG_CONFIG.target,
+                              "user": resolved_user}
+        if fetch:
+            try:
+                fetched = fetch_bundles(
+                    NG_CONFIG.target, NG_CONFIG.package or None,
+                    user=resolved_user,
+                    password=NG_CONFIG.password,
+                    insecure=NG_CONFIG.insecure, into_dir=NG_CONFIG.into_dir)
+                NG_CONFIG.bundles += [b for b in fetched
+                                      if b not in NG_CONFIG.bundles]
+                _reset_records()
+                recs = _ensure_records()
+                out.update({"fetched": len(fetched),
+                            "bundles_total": len(NG_CONFIG.bundles),
+                            "records": len(recs),
+                            "distinct": len(dedupe(recs))})
+            except (OSError, RuntimeError) as exc:
+                return {"connected": False, "error": str(exc),
+                        "target": NG_CONFIG.target}
+        if mcp is not None:
+            mcp._mcp_server.instructions = _mcp_instructions()
+        return out
 
     @mcp.tool(title="Cockpit host overview",
               description="Target, user, bundles, parsed record counts.")
@@ -1294,13 +1404,13 @@ def _run_mcp(args: Any) -> int:
         NG_CONFIG.writable = True
     if os.environ.get("COCKPIT_PASSWORD"):
         NG_CONFIG.password = os.environ["COCKPIT_PASSWORD"]
-    elif not args.quiet and sys.stdin.isatty():
-        NG_CONFIG.password = getpass.getpass(
-            "Cockpit password for %s: "
-            % (NG_CONFIG.user or getpass.getuser()))
+    # no getpass prompt here: the MCP stdio session owns stdin/stdout and a
+    # host is optional — cockpit_server connects (and asks, if on a tty)
     if NG_CONFIG.bundles:
         with contextlib.suppress(RuntimeError, OSError):
             _ensure_records()
+    if mcp is not None:
+        mcp._mcp_server.instructions = _mcp_instructions()
     try:
         mcp.run("stdio")            # type: ignore[union-attr]
     finally:

@@ -367,7 +367,13 @@ def http_get(path: str, headers: dict[str, str]) -> tuple[http.client.HTTPRespon
     """
     last_exc: Exception | None = None
     for attempt in (0, 1):
-        conn = _acquire_conn()
+        if attempt:
+            # The pooled socket was stale; its siblings are as old, so drop
+            # them all and retry on a fresh connection.
+            _reset_pool()
+            conn = _new_conn()
+        else:
+            conn = _acquire_conn()
         try:
             conn.request("GET", path, headers={**headers, "Accept-Encoding": "gzip"})
             resp = conn.getresponse()
