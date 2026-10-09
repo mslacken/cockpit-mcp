@@ -1,0 +1,16 @@
+{
+  "name": "cockpit-jsdis-parser",
+  "version": "1.0.0",
+  "description": "Static AST recovery of Cockpit bridge-mutating call sites (no execution)",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "@babel/parser": "^8.0.7",
+    "@babel/traverse": "^8.0.7"
+  }
+}
