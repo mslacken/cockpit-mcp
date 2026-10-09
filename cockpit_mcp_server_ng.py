@@ -51,8 +51,9 @@ importable):
     cockpit_overview()                   host, bundles, record counts
     cockpit_parse(bundles…)              parse now, in process
     cockpit_records(kind, substring)     search the records
-    cockpit_describe_record(index)       one record + its Call list
-    cockpit_invoke(index, …)             dry-run or perform (confirm gated)
+    cockpit_describe_record(index|site)  one record + its Call list
+    cockpit_invoke(index|site, …)        run it; only plans that may change
+                                         the host need confirm=true
 
 USAGE
 =====
@@ -74,8 +75,10 @@ import getpass
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
+import tempfile
 import sys
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
@@ -372,19 +375,23 @@ def run_parser(bundles: list[str | dict[str, Any]]) -> ParseResult:
         else:
             p = os.path.abspath(b)
             payload.append({"file": os.path.basename(p), "path": p})
-    workdir = os.path.dirname(parse_js)
-    in_path = os.path.join(workdir or ".", "in.json")
-    with open(in_path, "w", encoding="utf-8") as fh:
-        json.dump(payload, fh)
-    timeout = int(os.environ.get("COCKPIT_MCP_PARSE_TIMEOUT", "600"))
+    # the manifest is transient: keep it out of the source tree
+    tempdir = tempfile.mkdtemp(prefix="cockpit-mcp-")
+    in_path = os.path.join(tempdir, "in.json")
     try:
-        proc = subprocess.run([node, parse_js, in_path],
-                              check=False, capture_output=True,
-                              text=True, timeout=timeout)
-    except subprocess.TimeoutExpired:
-        r = ParseResult()
-        r.parse_errors.append("parse.js: timed out at %ds" % timeout)
-        return r
+        with open(in_path, "w", encoding="utf-8") as fh:
+            json.dump(payload, fh)
+        timeout = int(os.environ.get("COCKPIT_MCP_PARSE_TIMEOUT", "600"))
+        try:
+            proc = subprocess.run([node, parse_js, in_path],
+                                  check=False, capture_output=True,
+                                  text=True, timeout=timeout)
+        except subprocess.TimeoutExpired:
+            r = ParseResult()
+            r.parse_errors.append("parse.js: timed out at %ds" % timeout)
+            return r
+    finally:
+        shutil.rmtree(tempdir, ignore_errors=True)
     if proc.returncode != 0:
         r = ParseResult()
         r.parse_errors.append(
@@ -445,32 +452,41 @@ def record_to_calls(r: Record, req: Any | None,
     first = nodes[0]
     detail = "from parsed record @ %s:%d (%s)" % (r.file, r.pos, r.method)
 
-    def fill(argv: list[str], pool: dict[str, str],
-             extras: list[str], target: str | None) -> list[str]:
+    def fill(argv: list[str], pool: dict[str, Any],
+             extras: list[Any], target: str | None,
+             whole: bool = False) -> list[str]:
         # Named fill first (a caller may know the real name), then a
         # positional fill of the remaining holes: target → first hole,
         # the extra values in the order given → the following holes. This
         # is exactly the spec §8 model ("argv with holes to be filled by
         # the live target / extra values"); the hole names in the bundle
         # are minified, so positional order is the stable contract.
+        # A list value is spliced in as several argv elements (spread holes,
+        # or a variable that holds the whole argv). With `whole` the record's
+        # argv *is* one variable, so a plain string is shell-split as well.
         positional = list(extras)
         if target is not None:
             positional = [target] + positional
         pos_index = 0
-        def one(a: str) -> str:
+        def one(a: str) -> list[str]:
             nonlocal pos_index
             m = re.fullmatch(r"\{(.+)\}", a)
             if not m:
-                return a
+                return [a]
             key = m.group(1).strip()
             if key in pool:
-                return pool[key]
-            if pos_index < len(positional):
+                val = pool[key]
+            elif pos_index < len(positional):
                 val = positional[pos_index]
                 pos_index += 1
-                return val
-            return a
-        return [one(a) for a in argv]
+            else:
+                return [a]
+            if isinstance(val, (list, tuple)):
+                return [str(v) for v in val]
+            if whole:
+                return shlex.split(str(val))
+            return [str(val)]
+        return [x for a in argv for x in one(a)]
 
     def _arg_str_or_hole(x: Any) -> str:
         """Render a spec §5.1 node as an argv element: leaves as the raw value
@@ -500,23 +516,26 @@ def record_to_calls(r: Record, req: Any | None,
 
     if r.kind in ("spawn", "script"):
         argv: list[str] = []
-        if isinstance(first, Node) and first.k == "arr":
+        is_arr = isinstance(first, Node) and first.k == "arr"
+        # spawn(P): P is the whole argv; script(text) is one program text
+        whole = r.kind == "spawn" and not is_arr
+        if is_arr:
             for x in (first.v or []):
                 if not isinstance(x, Node) and not isinstance(x, dict):
                     x = Node("other", x)
                 argv.append(_arg_str_or_hole(x))
         else:
             argv.append(_arg_str_or_hole(first))
-        pool: dict[str, str] = {}
-        extra_list: list[str] = []
+        pool: dict[str, Any] = {}
+        extra_list: list[Any] = []
         target = None
         if req is not None:
             target = str(req.at) if getattr(req, "at", None) else None
-            pool.update({k: str(v) for k, v in (req.extra or {}).items()})
-            pool.update({k: str(v) for k, v in (req.arguments or {}).items()})
-            extra_list = [str(v) for v in (req.extra or {}).values()]
-            extra_list += [str(v) for v in (req.arguments or {}).values()]
-        argv = fill(argv, pool, extra_list, target)
+            pool.update(req.extra or {})
+            pool.update(req.arguments or {})
+            extra_list = list((req.extra or {}).values())
+            extra_list += list((req.arguments or {}).values())
+        argv = fill(argv, pool, extra_list, target, whole=whole)
         # resolve a stdin payload: CLI --stdin wins, then request extras
         stdin: str | None = stdin_override
         if stdin is None and req is not None:
@@ -527,9 +546,9 @@ def record_to_calls(r: Record, req: Any | None,
                     break
         if r.kind == "spawn":
             return [cbg.Call("spawn", argv=argv, stdin=stdin, detail=detail)]
-        return [cbg.Call("spawn",
-                         argv=["sh", "-c", " ".join(argv[1:])]
-                         if len(argv) > 1 else argv,
+        # cockpit.script(text, args): the text is one shell program, the
+        # args become $1… — never join them into the program text
+        return [cbg.Call("spawn", argv=["sh", "-c", argv[0], "sh"] + argv[1:],
                          stdin=stdin, detail=detail)]
     if r.kind == "dbus":
         # svc, path, iface, method are the first four slots (spec §7: they are
@@ -542,18 +561,20 @@ def record_to_calls(r: Record, req: Any | None,
             r.args.append(Node("other"))
         svc, path, iface, meth = r.args[:4]
 
-        def pick(n: Node, *names: str) -> str:
+        def pick(n: Node, *names: str, at: bool = False) -> str:
             v = _scalar(n)
-            if v in ("", "?", "<service>") and req is not None:
+            if (v in ("", "?", "<service>") or n.k == "var") and req is not None:
                 for nm in names:
                     for src in (req.extra or {}, req.arguments or {}):
                         if src.get(nm) not in (None, ""):
                             return str(src[nm])
+                if at and getattr(req, "at", None):
+                    return str(req.at)
             return v
 
         return [cbg.Call("dbus",
                          service=pick(svc, "service", "svc"),
-                         path=pick(path, "path"),
+                         path=pick(path, "path", at=True),
                          interface=pick(iface, "interface", "iface"),
                          method=_scalar(meth),
                          args=[(a.raw if a.raw is not None else {"k": a.k,
@@ -561,9 +582,19 @@ def record_to_calls(r: Record, req: Any | None,
                                for a in r.args[4:]],
                          detail=detail)]
     if r.kind == "file":
-        svc = first.v if isinstance(first, Node) and first.k == "str" \
-            else (first.v if first.v else "<path>")
-        return [cbg.Call("spawn", argv=["cat", str(svc)], detail=detail)]
+        # a literal path is used as is; a variable path is a hole that the
+        # caller fills with `at` (or extra/arguments "path")
+        if isinstance(first, Node) and first.k == "str":
+            fpath = str(first.v)
+        else:
+            fpath = _arg_str_or_hole(first)
+            if req is not None:
+                src = dict(req.extra or {}, **(req.arguments or {}))
+                if src.get("path") not in (None, ""):
+                    fpath = str(src["path"])
+                elif getattr(req, "at", None):
+                    fpath = str(req.at)
+        return [cbg.Call("spawn", argv=["cat", fpath], detail=detail)]
     if r.kind == "proxy":
         return [cbg.Call("spawn",
                          argv=["<proxy>", str(r.interface or "?"),
@@ -576,6 +607,153 @@ def record_to_calls(r: Record, req: Any | None,
 
 def _scalar(n: Node) -> str:
     return str(n.v) if n.k in ("str", "var") else str(n.k)
+
+
+# ==========================================================================
+# Danger: which planned calls need confirm=true
+# ==========================================================================
+#
+# Only calls that can change the host (or leak secrets) are gated. A call is
+# safe when its command is on the read-only list below (optionally narrowed to
+# read-only subcommands/flags), or when it is a D-Bus getter. Anything unknown
+# counts as dangerous: the list errs on the side of asking.
+
+# command → None (any arguments are read-only) or a predicate over argv[1:]
+_SAFE_COMMANDS: dict[str, Any] = {
+    "cat": None, "date": lambda a: not any(x in ("-s", "--set") or
+                                           x.startswith("--set=") for x in a),
+    "findmnt": None, "test": None, "[": None, "stat": None, "ls": None,
+    "head": None, "tail": None, "grep": None, "md5sum": None, "wc": None,
+    "uname": None, "id": None, "getent": None, "lsblk": None, "df": None,
+    "free": None, "uptime": None, "true": None, "echo": None,
+    "udevadm": lambda a: a[:1] == ["info"],
+    "showmount": None, "lsinitrd": None,
+    "vdoformat": lambda a: a == ["--version"],
+    "kpatch": lambda a: a[:1] == ["list"],
+    "wg": lambda a: a[:1] in (["pubkey"], ["show"], ["genkey"]),
+    "systemctl": lambda a: _first_word(a) in (
+        "show", "status", "is-enabled", "is-active", "is-failed", "cat",
+        "list-units", "list-unit-files", "list-timers", "list-sockets"),
+    "timedatectl": lambda a: _first_word(a) in ("", "status", "show",
+                                                "list-timezones",
+                                                "timesync-status"),
+    "hostnamectl": lambda a: _first_word(a) in ("", "status"),
+    "journalctl": lambda a: not any(x.startswith(("--vacuum", "--rotate",
+                                                  "--flush", "--sync"))
+                                    for x in a),
+    "zypper": lambda a: _first_word(a) in (
+        "repos", "lr", "search", "se", "info", "if", "list-updates", "lu",
+        "list-patches", "lp", "patches", "packages", "pa", "products", "pd",
+        "services", "ls", "patch-check", "pchk", "what-provides", "wp",
+        "ps", "needs-rebooting"),
+    "rpm": lambda a: bool(a) and a[0].startswith("-q"),
+    "suseconnect": lambda a: bool(a) and all(
+        x in ("-s", "--status", "--status-text", "-l", "--list-extensions",
+              "--json") for x in a),
+    "cryptsetup": lambda a: _first_word(a) in ("luksDump", "status",
+                                               "isLuks"),
+    "update-crypto-policies": lambda a: a == ["--show"],
+    "btrfs": lambda a: a[:2] in (["subvolume", "list"], ["subvolume", "show"],
+                                 ["filesystem", "show"], ["filesystem", "df"],
+                                 ["filesystem", "usage"]),
+    "command": lambda a: a[:1] == ["-v"],
+    "last": None, "pwscore": None,
+    "lastlog": lambda a: not any(x in ("-C", "--clear", "-S", "--set")
+                                 for x in a),
+    "chage": lambda a: bool(a) and a[0] in ("-l", "--list"),
+    "passwd": lambda a: bool(a) and a[0] in ("-S", "--status"),
+    "useradd": lambda a: a == ["-D"],
+    "loginctl": lambda a: _first_word(a).startswith(("list-", "show-")) or
+    _first_word(a) in ("user-status", "session-status", "seat-status"),
+    "dnf": lambda a: a == ["--version"] or _first_word(a) in (
+        "needs-restarting", "list", "info", "repolist", "repoquery",
+        "search", "check-update", "history"),
+}
+
+# files whose content is a secret even though reading them changes nothing
+_SECRET_FILES = ("/etc/shadow", "/etc/gshadow", "/etc/ssh/ssh_host_",
+                 "/root/.ssh/", "/etc/NetworkManager/system-connections/")
+
+# D-Bus methods that only read
+_SAFE_DBUS = re.compile(r"(Get|List|Introspect|Ping|Query|Can|Is|Has|Poll)"
+                        r"[A-Za-z]*$")
+
+
+def _first_word(args: list[str]) -> str:
+    """First non-option argument (the subcommand), '' if there is none."""
+    return next((a for a in args if not a.startswith("-")), "")
+
+
+def _argv_danger(argv: list[str]) -> str | None:
+    """Why this argv may change the host, or None if it is read-only."""
+    if not argv:
+        return "empty command"
+    cmd = os.path.basename(argv[0])
+    if cmd in ("sh", "bash") and len(argv) >= 3 and argv[1] == "-c":
+        return _shell_danger(argv[2])
+    if cmd not in _SAFE_COMMANDS:
+        return "%s is not a known read-only command" % cmd
+    check = _SAFE_COMMANDS[cmd]
+    if check is not None and not check(argv[1:]):
+        return "%s %s may change the host" % (cmd, " ".join(argv[1:]))
+    if cmd == "cat" and any(a.startswith(_SECRET_FILES) for a in argv[1:]):
+        return "reads secret file(s)"
+    return None
+
+
+def _shell_danger(script: str) -> str | None:
+    """A shell snippet is safe only if it is a pipeline / &&/|| chain of
+    read-only commands without redirects, substitutions or ';'."""
+    # a single '|' is a pipe and fine; only redirects/subshells/';' are not
+    if re.search(r"[;<>`]|\$\(", script):
+        return "shell script with redirects or substitutions"
+    try:
+        tokens = shlex.split(script)
+    except ValueError:
+        return "unparsable shell script"
+    segment: list[str] = []
+    for tok in tokens + ["|"]:
+        if tok in ("|", "||", "&&"):
+            if segment:
+                why = _argv_danger(segment)
+                if why:
+                    return why
+            segment = []
+        elif tok == "&":
+            return "shell script with background jobs"
+        elif tok == "!" and not segment:
+            continue                    # negating the exit status only
+        else:
+            segment.append(tok)
+    return None
+
+
+def classify_calls(calls: list[Any]) -> list[str]:
+    """Reasons the plan needs confirm=true; empty means it only reads."""
+    reasons: list[str] = []
+    for c in calls:
+        if c.op == "spawn":
+            why = _argv_danger(list(c.argv))
+        elif c.op == "dbus":
+            why = None if _SAFE_DBUS.match(c.method or "") else \
+                "D-Bus %s.%s may change the host" % (c.interface or "?",
+                                                     c.method or "?")
+        else:
+            why = "unknown call type %s" % c.op
+        if why:
+            reasons.append(why)
+    return reasons
+
+
+def unfilled_holes(calls: list[Any]) -> list[str]:
+    """`{…}` placeholders still left in a plan (the caller must fill them)."""
+    holes: list[str] = []
+    for c in calls:
+        vals = list(c.argv) if c.op == "spawn" else [c.service, c.path,
+                                                     c.interface]
+        holes += [v for v in vals
+                  if re.fullmatch(r"\{.+\}|<[a-z ]+>|\?", v or "")]
+    return holes
 
 
 def perform_bridge(calls: list[Any],
@@ -722,6 +900,9 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--quiet", action="store_true", help="less log output")
     p.add_argument("--mcp", action="store_true",
                    help="serve over stdio as an MCP server")
+    p.add_argument("--writable", action="store_true",
+                   help="--mcp: let cockpit_invoke perform plans that may "
+                        "change the host (still needs confirm=true)")
     p.add_argument("--version", action="store_true")
     args = p.parse_args(argv)
 
@@ -948,78 +1129,132 @@ if MCP_AVAILABLE and FastMCP is not None:
                 "kinds": _count_kinds(recs),
                 "brief": _state_brief(ded)[:8]}
 
+    def _resolve(index: int | None, site: str | None
+                 ) -> tuple[int, Record] | dict[str, Any]:
+        """Pick a record by global index or by its `file:pos` site."""
+        recs = _RECS_DEDUPED or _ensure_records()
+        if site:
+            fname, _, pos = site.rpartition(":")
+            for i, r in enumerate(recs):
+                if (pos.isdigit() and r.pos == int(pos)
+                        and fname and r.file.endswith(fname)):
+                    return i, r
+            return {"error": "no record at site %r (want <file>:<pos> as "
+                             "shown in cockpit_records)" % site}
+        index = 0 if index is None else index
+        if not 0 <= index < len(recs):
+            return {"error": "index %d out of range (0..%d)"
+                             % (index, len(recs) - 1)}
+        return index, recs[index]
+
+    def _plan_info(calls: list[Any]) -> dict[str, Any]:
+        reasons = classify_calls(calls)
+        return {"plan": [c.as_json() for c in calls],
+                "dangerous": bool(reasons),
+                **({"danger": reasons} if reasons else {}),
+                **({"holes": holes} if (holes := unfilled_holes(calls))
+                   else {})}
+
     @mcp.tool(title="List Cockpit records",
-              description="De-duplicated bridge-mutating call sites.")
+              description="De-duplicated bridge-mutating call sites. Each "
+                          "record carries its global `index` (and `site`) "
+                          "for cockpit_describe_record / cockpit_invoke.")
     async def cockpit_records(kind: str = "any",
                               substring: str = "",
                               limit: int = 20) -> dict[str, Any]:
-        recs = [r for r in (_RECS_DEDUPED or _ensure_records())
+        recs = [(i, r) for i, r in enumerate(_RECS_DEDUPED or _ensure_records())
                 if kind in ("any", "all", r.kind)
                 and (not substring or substring in r.render())]
         return {"count": len(recs), "returned": len(recs[:limit]),
-                "records": [r.as_dict() for r in recs[:limit]]}
+                "records": [{"index": i, "site": "%s:%d" % (r.file, r.pos),
+                             **r.as_dict()} for i, r in recs[:limit]]}
 
     @mcp.tool(title="Describe one Cockpit record",
-              description="One record in full, plus its Call list.")
-    async def cockpit_describe_record(index: int = 0) -> dict[str, Any]:
-        recs = _RECS_DEDUPED or _ensure_records()
-        if index >= len(recs):
-            return {"error": "index %d out of range (0..%d)"
-                        % (index, len(recs) - 1)}
-        rec = recs[index]
-        out = rec.as_dict()
+              description="One record in full, plus its Call list and whether "
+                          "running it needs confirm=true. Select by global "
+                          "`index` or by `site` (<file>:<pos>).")
+    async def cockpit_describe_record(index: int | None = None,
+                                      site: str | None = None
+                                      ) -> dict[str, Any]:
+        found = _resolve(index, site)
+        if isinstance(found, dict):
+            return found
+        index, rec = found
+        out = {"index": index, "site": "%s:%d" % (rec.file, rec.pos),
+               **rec.as_dict()}
         if cbg is not None:
             try:
-                out["would_call"] = [c.as_json()
-                                     for c in record_to_calls(rec, None)]
+                info = _plan_info(record_to_calls(rec, None))
+                out["would_call"] = info.pop("plan")
+                out.update(info)
             except Exception as exc:   # noqa: BLE001
                 out["would_call_error"] = str(exc)
         return out
 
     @mcp.tool(title="Perform one Cockpit record",
-              description="Dry-run or execute the recipe for a record. "
-                          "confirm=true required for a real change.")
-    async def cockpit_invoke(index: int = 0,
+              description="Run the recipe for a record (select by global "
+                          "`index` or `site` <file>:<pos>). Read-only plans "
+                          "run directly; plans that may change the host are "
+                          "only shown unless confirm=true (and the server is "
+                          "--writable). dry_run=true always just shows the "
+                          "plan. `at` fills the first {…} hole of the argv, a "
+                          "variable file path, or an unknown D-Bus object "
+                          "path; `extra`/`arguments` fill holes by name, then "
+                          "in order. A list value fills one hole with several "
+                          "argv elements; when the whole argv is one hole "
+                          "(argv=[ {P} ]) a string is shell-split.")
+    async def cockpit_invoke(index: int | None = None,
+                             site: str | None = None,
                              arguments: dict[str, Any] | None = None,
                              extra: dict[str, Any] | None = None,
                              at: str | None = None,
-                             dry_run: bool = True,
+                             dry_run: bool = False,
                              confirm: bool = False) -> dict[str, Any]:
-        can_mutate = (not NG_CONFIG.read_only) and NG_CONFIG.writable
-        if not can_mutate and not dry_run:
-            # Default is read-only: without an explicit writable flag this tool
-            # will only ever list the plan, and says so rather than pretending.
-            dry_run = True
-        recs = _RECS_DEDUPED or _ensure_records()
-        if index >= len(recs):
-            return {"error": "index %d out of range (0..%d)"
-                        % (index, len(recs) - 1)}
-        rec = recs[index]
+        found = _resolve(index, site)
+        if isinstance(found, dict):
+            return found
+        index, rec = found
+        head = {"index": index, "site": "%s:%d" % (rec.file, rec.pos),
+                "record": rec.render()}
         if cbg is None:
-            return {"error": "cockpit_bridge not importable",
-                    "record": rec.as_dict()}
+            return {"error": "cockpit_bridge not importable", **head}
         try:
             req = cbg.Request(dict(arguments or {}), dict(extra or {}), at)
             calls = record_to_calls(rec, req)
+            if at:
+                plain = cbg.Request(dict(arguments or {}), dict(extra or {}))
+                if ([c.render() for c in record_to_calls(rec, plain)]
+                        == [c.render() for c in calls]):
+                    head["warning"] = ("`at` was not used: this record has "
+                                       "no hole for it (to select a record "
+                                       "by position use `site`)")
         except Exception as exc:   # noqa: BLE001
-            return {"error": str(exc), "dry_run": dry_run,
-                    "record": rec.as_dict()}
+            return {"error": str(exc), **head}
+        info = _plan_info(calls)
         if dry_run:
-            return {"performed": False, "dry_run": True,
-                    "backend": "bridge", "record": rec.as_dict(),
-                    "plan": [c.as_json() for c in calls],
-                    "note": "a dry run lists what cockpit_bridge would do"}
-        if not confirm:
-            return {"error": "a destructive change needs confirm=true",
-                    "record": rec.as_dict(),
-                    "plan": [c.as_json() for c in calls]}
+            return {"performed": False, "dry_run": True, **head, **info}
+        if "holes" in info:
+            return {"performed": False, **head, **info,
+                    "error": "the plan still has unfilled holes: pass `at`, "
+                             "`extra` or `arguments` for them"}
+        if info["dangerous"]:
+            if not NG_CONFIG.writable or NG_CONFIG.read_only:
+                return {"performed": False, **head, **info,
+                        "error": "this plan may change the host and the "
+                                 "server is read-only (start it with "
+                                 "--writable)"}
+            if not confirm:
+                return {"performed": False, **head, **info,
+                        "error": "this plan may change the host: review it "
+                                 "and call again with confirm=true"}
         try:
-            return perform_bridge(calls, NG_CONFIG.password or None)
+            result = perform_bridge(calls, NG_CONFIG.password or None)
+            return {**head, "dangerous": info["dangerous"], **result}
         except (OSError, RuntimeError, ConnectionError, struct.error) as exc:
             if cbg.BRIDGE is not None:
                 cbg.BRIDGE.close()
             return {"error": str(exc), "performed": False,
-                    "backend": "bridge"}
+                    "backend": "bridge", **head}
 
     @mcp.tool(title="Re-fetch and re-parse",
               description="Log in, fetch every page bundle, re-parse.")
@@ -1054,6 +1289,9 @@ def _run_mcp(args: Any) -> int:
         NG_CONFIG.package = list(args.package)
     if args.into:
         NG_CONFIG.into_dir = args.into
+    if args.writable:
+        NG_CONFIG.read_only = False
+        NG_CONFIG.writable = True
     if os.environ.get("COCKPIT_PASSWORD"):
         NG_CONFIG.password = os.environ["COCKPIT_PASSWORD"]
     elif not args.quiet and sys.stdin.isatty():
