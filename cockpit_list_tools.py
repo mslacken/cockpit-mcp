@@ -2,6 +2,15 @@
 """
 cockpit_list_tools.py — list the capabilities of a *running* Cockpit server.
 
+FOR DEBUGGING ONLY
+------------------
+This is a debug aid, not part of the MCP server's normal operation: it
+lists a running Cockpit host's UI (its pages and the buttons, inputs,
+selects and dialogs on each), optionally re-read them as a mock MCP tool
+catalog (--tools) and attach a snapshot of what each page currently shows
+(--live). It is strictly read-only — nothing here invokes anything or
+changes the host. Do not rely on it in production.
+
 WHAT IT DOES
 ============
 Cockpit's UI is a set of *packages*; each package ships a manifest.json that

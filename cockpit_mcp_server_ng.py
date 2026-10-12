@@ -2,46 +2,13 @@
 """
 cockpit_mcp_server_ng.py — Cockpit bundle extractor + MCP server.
 
-WHAT THIS IS
+WHAT THIS DOES
 ============
-The Python half of a two-program pipeline implementing the parser and
-recipe contract from COCKPIT_JSDIS_SPEC.md:
 
-    bundle  →  parse.js (Node + @babel/parser + @babel/traverse)
-    →  [ {kind, argv, opts, stdin, file, pos, func, …} ]
-    →  dedupe, render per spec §5 / §10.1
-    →  record_to_calls()  →  list[cockpit_bridge.Call]  →  cockpit-bridge
-
-The Node shim does the static parsing (the spec, §7/§9, mandates a JS AST
-parser and forbids executing the bundle); this script drives it, models the
+Reads all the packages of cocpit server and use a Node shim for the static 
+parsing not a execution. The ouput is modeleled to 
 records, renders them, dedupes them, bridges them to cockpit_bridge.Call
 objects, and exposes the lot as a CLI and an MCP server.
-
-WHAT THE RECORD CONTRACT SAYS
-============================
-Per spec §5 / §10.1, every bridge-mutating call site becomes a record:
-
-    {
-      "kind":      "spawn" | "script" | "dbus" | "file" | "proxy",
-      "argv":      [ <node>… ]            // argv array (or primary str)
-      "opts":      { "superuser": "require"|"try"|null,
-                     "err":       "message"|"out"|null,
-                     "bus":       "internal"|"system"|null,
-                     "env":       ["LC_ALL=C"],
-                     "pty":       false }
-      "stdin":     <node> | null,          // the .input() payload
-      "chain":     [ "then", "catch" ],    // promise tail, context only
-      "file":      "…/users.js",
-      "pos":       12345,
-      "func":      "changeLocked" | null,  // §6.2 enclosing helper
-      "passthrough": true                  // only if argv is a bare variable
-    }
-
-A "node" in argv is one of (spec §5.1):
-    str, num, bool, arr, var, cond, call, binop, member, obj, tpl.
-
-The parser classifies; the recipe-filler (this file) decides which
-{…} holes the caller fills with `at` / `extra` when the action runs.
 
 WHAT THE MCP LAYER ADDS
 =======================
@@ -136,8 +103,6 @@ def _find_node() -> str:
 # ==========================================================================
 
 class Node:
-    """A spec §5.1 argv element: a leaf value or a composite."""
-
     __slots__ = ("k", "v", "raw")
 
     def __init__(self, k: str, v: Any = None, raw: Any = None) -> None:
@@ -187,7 +152,7 @@ def _node_render(x: Any) -> str:
 
 
 class Opts:
-    """The options object of a cockpit.* call (spec §3)."""
+    """The options object of a cockpit.* call """
 
     __slots__ = ("superuser", "err", "bus", "env", "pty", "extras")
 
@@ -423,7 +388,8 @@ def run_parser(bundles: list[str | dict[str, Any]]) -> ParseResult:
 
 
 # ==========================================================================
-# Dedupe: spec §2's "distinct, de-duplicated"
+# Dedupe: as cockpit has differnt buttons leading to the same actions we 
+# have to de-duplicate
 # ==========================================================================
 
 def dedupe(records: list[Record]) -> list[Record]:
@@ -494,10 +460,10 @@ def record_to_calls(r: Record, req: Any | None,
         return [x for a in argv for x in one(a)]
 
     def _arg_str_or_hole(x: Any) -> str:
-        """Render a spec §5.1 node as an argv element: leaves as the raw value
+        """Render a spec node as an argv element: leaves as the raw value
         (so `"chpasswd"` becomes `chpasswd`, not `'"chpasswd"'`); non-leaves
-        keep their placeholder form `{…}`. The `fill()` pass below matches
-        placeholders of the form `{…}` — this is what lets a caller pass an
+        keep their placeholder form `{...}`. The `fill()` pass below matches
+        placeholders of the form `{...}` - this is what lets a caller pass an
         `at` / `extra` value straight into one of those slots."""
         # x may be a bare value (e.g. from a record that used Node.raw), a
         # dict node, or a Node instance.
@@ -552,11 +518,11 @@ def record_to_calls(r: Record, req: Any | None,
         if r.kind == "spawn":
             return [cbg.Call("spawn", argv=argv, stdin=stdin, detail=detail)]
         # cockpit.script(text, args): the text is one shell program, the
-        # args become $1… — never join them into the program text
+        # args become $1... — never join them into the program text
         return [cbg.Call("spawn", argv=["sh", "-c", argv[0], "sh"] + argv[1:],
                          stdin=stdin, detail=detail)]
     if r.kind == "dbus":
-        # svc, path, iface, method are the first four slots (spec §7: they are
+        # svc, path, iface, method are the first four slots (they are
         # literal in the bundle); everything after is payload. A slot that
         # came back as an unknown ("?" or a bare var) is filled by the caller,
         # so a proxy record whose interface the page resolves at runtime can
@@ -647,7 +613,7 @@ _SAFE_COMMANDS: dict[str, Any] = {
                                                   "--flush", "--sync"))
                                     for x in a),
     "zypper": lambda a: _first_word(a) in (
-        "repos", "lr", "search", "se", "info", "if", "list-updates", "lu",
+        "repos", "lr", "search", "se", "info", "if", "list-up dates", "lu",
         "list-patches", "lp", "patches", "packages", "pa", "products", "pd",
         "services", "ls", "patch-check", "pchk", "what-provides", "wp",
         "ps", "needs-rebooting"),

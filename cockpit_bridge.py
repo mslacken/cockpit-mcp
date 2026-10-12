@@ -2,57 +2,6 @@
 """
 cockpit_bridge.py — perform Cockpit actions over the bridge, without a browser.
 
-WHY THIS EXISTS
-===============
-cockpit_mcp_server.py performs an action the only way the UI can be asked to:
-it drives a headless Chromium through the page. That is faithful — whatever
-the dialog does, it does — but it needs a browser on the machine running the
-server, and it costs a page load and a render per action.
-
-The page itself does not talk to a browser. It talks to cockpit-bridge over
-the session WebSocket, in a protocol (doc/protocol.md) that
-cockpit_list_tools.py already speaks for its live probes. Everything a dialog
-does when its button is pressed is one or two messages on that socket:
-
-    cockpit.spawn(["/usr/sbin/userdel", "-r", name], {superuser: "require"})
-    client.call("/org/freedesktop/systemd1", …, "RestartUnit", [unit, "fail"])
-
-So for the actions whose call is known, the browser is not needed at all.
-This module is that path: a privileged bridge session, plus a table of
-adapters mapping catalog action names to the calls their dialogs make.
-
-WHAT IT CANNOT BE
-=================
-It cannot be derived from the scan. The bundles say which button exists, not
-what it does: Cockpit's older dialogs keep their handler inline — parsing the
-``{actions: [{caption, style, clicked}]}`` footers recovers the exact argv —
-but there are 14 of those host-wide, and everything newer is React, where of
-764 ``onClick`` props exactly two contain a bridge call; the rest delegate to
-named functions. So the adapters below are *hand-written* from the page
-sources, each one a transcription of a specific call site, cited in a comment.
-
-Hence the division of labour, which cockpit_invoke implements:
-
-    an action with an adapter   → the bridge: no browser, ~0.1s
-    everything else             → the browser, as before
-
-An adapter that is handed too little to build its calls raises Unsupported,
-and the caller falls back to the browser rather than guessing.
-
-THE PRIVILEGED BRIDGE
-=====================
-Most of these calls need root, and a channel asking for it before the
-privileged bridge exists is refused outright (src/cockpit/superuser.py,
-apply_rule → "access-denied"). Starting it from a WebSocket client is not
-guessable from the docs:
-
-  * ``{"command":"init", …, "superuser":{"id":"any"}}`` does nothing —
-    cockpit-ws consumes the client's init and never forwards it to the bridge.
-  * The way the shell's own menu does it is a ``dbus-json3`` channel on
-    ``"bus":"internal"`` and ``Start("any")`` on /superuser.
-  * That call hangs forever unless the channel first sends an ``add-match``
-    for the interface: without it the sudo password ``Prompt`` signal is never
-    delivered. Answer it with ``Answer([password])``.
 
 USAGE
 =====

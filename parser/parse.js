@@ -2,10 +2,9 @@
 /*
  * parse.js — static recovery of Cockpit bridge-mutating call sites.
  *
- * Implements COCKPIT_JSDIS_SPEC.md §5. Reads one or more served .js bundles,
- * parses them with @babel/parser (NO execution, vm, or eval), walks the AST
- * with @babel/traverse, and emits — on stdout, as a JSON array — one record per
- * bridge-mutating call site:
+ * Reads one or more served .js bundles, parses them with @babel/parser 
+ * (NO execution, vm, or eval), walks the AST with @babel/traverse, and 
+ * emits — on stdout, as a JSON array — one record per bridge-mutating call site:
  *
  *   { "kind":    "spawn"|"script"|"dbus"|"file"|"proxy",
  *     "method":  "spawn"|"script"|"Format"|…,
@@ -291,10 +290,12 @@ function dbusRoot(p) {
   };
 }
 // --------------------------------------------------------------------------
-// §7 proxy follower — best-effort: any failure here is ignored, it only ever
+// proxy follower — best-effort: any failure here is ignored, it only ever
 // adds D-Bus method records, never disturbs the core spawn / script / file set.
 //   X = Y.dbus(SVC, opts) ; X = Y.proxy(IFACE, path) ; X.Method(args…)
 // --------------------------------------------------------------------------
+
+// Curated list of the used expression in the cockpit src tree.
 const PLUMBING = new Set(["then", "catch", "finally", "done", "on", "off", "once",
   "emit", "addListener", "removeListener", "close", "send", "write", "read",
   "clear", "toString", "prototype", "call", "apply", "bind", "get", "set",
