@@ -5,8 +5,8 @@ cockpit_mcp_server_ng.py — Cockpit bundle extractor + MCP server.
 WHAT THIS DOES
 ============
 
-Reads all the packages of cocpit server and use a Node shim for the static 
-parsing not a execution. The ouput is modeleled to 
+Reads all the packages of cocpit server and parses them statically with
+tree-sitter (cockpit_js_parser.py), not by execution. The ouput is modeleled to
 records, renders them, dedupes them, bridges them to cockpit_bridge.Call
 objects, and exposes the lot as a CLI and an MCP server.
 
@@ -47,10 +47,7 @@ import json
 import os
 import re
 import shlex
-import shutil
 import socket
-import subprocess
-import tempfile
 import sys
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
@@ -64,42 +61,18 @@ try:
     import cockpit_list_tools as clt
 except ImportError:                          # pragma: no cover - optional
     clt = None                               # type: ignore
+try:
+    import cockpit_js_parser as cjp
+except ImportError as _exc:                  # pragma: no cover - reported on use
+    cjp = None                               # type: ignore
+    _CJP_ERROR = str(_exc)
 
-HERE = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_TARGET = "localhost:9090"
-NODE = os.environ.get("COCKPIT_MCP_NODE", "node")
-PARSER_JS = os.path.join(HERE, "parser", "parse.js")
-FALLBACK_JS = "/tmp/opencode/parser/parse.js"
 DEFAULT_FETCH_DIR = "/tmp/opencode/live"
 
 
 # ==========================================================================
-# Node shim availability
-# ==========================================================================
-
-def ensure_parser() -> str:
-    """Path to a working parse.js shim (or a clear failure)."""
-    env_p = os.environ.get("COCKPIT_JSDIS_PARSE_JS")
-    if env_p and os.path.exists(env_p):
-        return env_p
-    for cand in (PARSER_JS, FALLBACK_JS):
-        if os.path.exists(cand):
-            return cand
-    raise RuntimeError(
-        "parser shim not found: expect " + PARSER_JS + " (or set "
-        "COCKPIT_JSDIS_PARSE_JS=/path/to/parse.js)")
-
-
-def _find_node() -> str:
-    p = shutil.which(NODE)
-    if not p:
-        raise RuntimeError("Node required to run parse.js; install it or "
-                           "point COCKPIT_MCP_NODE at a node binary")
-    return p
-
-
-# ==========================================================================
-# Record model (Python mirror of the Node shim output)
+# Record model (Python mirror of the cockpit_js_parser records)
 # ==========================================================================
 
 class Node:
@@ -333,11 +306,12 @@ class ParseResult:
 
 
 def run_parser(bundles: list[str | dict[str, Any]]) -> ParseResult:
-    """Parse each bundle via the Node shim and lift the records."""
+    """Parse each bundle in process and lift the records."""
     if not bundles:
         raise RuntimeError("run_parser: no bundles given")
-    parse_js = ensure_parser()
-    node = _find_node()
+    if cjp is None:
+        raise RuntimeError("bundle parser unavailable (%s); install "
+                           "tree-sitter and tree-sitter-javascript" % _CJP_ERROR)
     payload: list[dict[str, Any]] = []
     for b in bundles:
         if isinstance(b, dict):
@@ -345,34 +319,7 @@ def run_parser(bundles: list[str | dict[str, Any]]) -> ParseResult:
         else:
             p = os.path.abspath(b)
             payload.append({"file": os.path.basename(p), "path": p})
-    # the manifest is transient: keep it out of the source tree
-    tempdir = tempfile.mkdtemp(prefix="cockpit-mcp-")
-    in_path = os.path.join(tempdir, "in.json")
-    try:
-        with open(in_path, "w", encoding="utf-8") as fh:
-            json.dump(payload, fh)
-        timeout = int(os.environ.get("COCKPIT_MCP_PARSE_TIMEOUT", "600"))
-        try:
-            proc = subprocess.run([node, parse_js, in_path],
-                                  check=False, capture_output=True,
-                                  text=True, timeout=timeout)
-        except subprocess.TimeoutExpired:
-            r = ParseResult()
-            r.parse_errors.append("parse.js: timed out at %ds" % timeout)
-            return r
-    finally:
-        shutil.rmtree(tempdir, ignore_errors=True)
-    if proc.returncode != 0:
-        r = ParseResult()
-        r.parse_errors.append(
-            "parse.js exit %d: %s" % (proc.returncode, proc.stderr[:800]))
-        return r
-    try:
-        data = json.loads(proc.stdout)
-    except json.JSONDecodeError as exc:
-        r = ParseResult()
-        r.parse_errors.append("parse.js output: %s" % exc)
-        return r
+    data = cjp.parse_bundles(payload)
     out = ParseResult()
     for d in data:
         if isinstance(d, dict) and d.get("kind") == "error":

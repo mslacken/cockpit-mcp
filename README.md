@@ -14,9 +14,9 @@ The project is a multi-program pipeline implementing access to a Cockpit server:
 1. **Fetch** — `cockpit_list_tools.py` talks to a running Cockpit host the way
    a browser does (login, WebSocket handshake, `manifests.json`) and
    downloads the page JavaScript bundles.
-2. **Parse** — instead of executing the bundles, `parser/parse.js`
-   (Node + `@babel/parser` + `@babel/traverse`) statically
-   walks the AST and recovers every bridge-mutating call site
+2. **Parse** — instead of executing the bundles, `cockpit_js_parser.py`
+   (python-tree-sitter + `tree-sitter-javascript`) statically
+   walks the syntax tree and recovers every bridge-mutating call site
    (`cockpit.spawn`, dbus calls, proxy calls, file writes) as a JSON record.
 3. **Model** — `cockpit_mcp_server_ng.py` ingests those records, models them
    (`Node`/`Record` classes), dedupes them, and renders them per the record
@@ -43,7 +43,7 @@ flowchart TD
 
     subgraph Server["cockpit-mcp"]
         FETCH["cockpit_list_tools.py<br/>fetch bundles"]
-        PARSE["parser/parse.js<br/>static AST walk (no execution)"]
+        PARSE["cockpit_js_parser.py<br/>static tree-sitter walk (no execution)"]
         MODEL["cockpit_mcp_server_ng.py<br/>Node / Record / dedupe / render"]
         TO_CALLS["record_to_calls()<br/>record → bridge.Calls"]
         PERFORM["cockpit_bridge.py<br/>Call / Request / perform()"]
@@ -72,13 +72,12 @@ flowchart TD
 | `cockpit_mcp_server_ng.py` | Main entry point (CLI + MCP server) |
 | `cockpit_bridge.py` | Bridge backend (`Call`/`Request`/`perform`) |
 | `cockpit_list_tools.py` | Host connect / asset fetch (stdlib only) |
-| `parser/` | Node shim: `parse.js` + `@babel` deps (bundled `node_modules`) |
+| `cockpit_js_parser.py` | Bundle parser (tree-sitter, in process) |
 | `requirements.txt` | Python deps |
 
 ## Requirements
 
 - Python 3.10+
-- `node` (or point `COCKPIT_MCP_NODE` at a node binary)
 - `pip install -r requirements.txt`
 
 ## Usage
@@ -106,8 +105,5 @@ flowchart TD
 
 ## Notes
 
-- `parser/node_modules` ships `@babel/parser` + `@babel/traverse`; if you
-  strip `node_modules`, run `npm install` inside `parser/` and set
-  `COCKPIT_JSDIS_PARSE_JS=/path/to/parser/parse.js`
 - Optional modules degrade gracefully: without `cockpit_bridge.py`, the
   `invoke` tool reports an error; parsing and records still work.
