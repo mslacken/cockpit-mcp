@@ -45,46 +45,12 @@ import math
 import os
 import re
 import sys
-import warnings
 from typing import Any
 
+import tree_sitter_javascript
 from tree_sitter import Language, Node, Parser, Query, QueryCursor
 
-
-_LIB_NAMES = ("libtree-sitter-javascript.so",
-              "libtree-sitter-javascript.so.0")
-
-
-def _js_language() -> Language:
-    """Load the JavaScript grammar.
-
-    Prefer the pip `tree_sitter_javascript` wheel; otherwise fall back to
-    the system shared library (e.g. the openSUSE `tree-sitter-javascript`
-    package providing `libtree-sitter-javascript.so`), calling its
-    `tree_sitter_javascript` entry point through ctypes."""
-    try:
-        import tree_sitter_javascript
-        return Language(tree_sitter_javascript.language())
-    except ModuleNotFoundError:
-        import ctypes
-        for root in ("/usr/lib64", "/usr/lib", "/usr/local/lib"):
-            for name in _LIB_NAMES:
-                path = os.path.join(root, name)
-                if not os.path.exists(path):
-                    continue
-                lib = ctypes.CDLL(path)
-                fn = lib.tree_sitter_javascript
-                fn.restype = ctypes.c_void_p
-                # tree-sitter >= 0.26 takes the language pointer as an int
-                # (a raw c_void_p object is rejected); silence the deprecation
-                # warning for the int form.
-                with warnings.catch_warnings():
-                    warnings.simplefilter("ignore", DeprecationWarning)
-                    return Language(int(fn()))
-        raise
-
-
-JS = _js_language()
+JS = Language(tree_sitter_javascript.language())
 
 METHODS = {"spawn": "spawn", "spawnp": "spawn", "script": "script",
            "dbus": "dbus", "file": "file"}

@@ -63,7 +63,7 @@ except ImportError:                          # pragma: no cover - optional
     clt = None                               # type: ignore
 try:
     import cockpit_js_parser as cjp
-except ImportError as _exc:                  # pragma: no cover - reported on use
+except (ImportError, OSError) as _exc:       # pragma: no cover - reported on use
     cjp = None                               # type: ignore
     _CJP_ERROR = str(_exc)
 
