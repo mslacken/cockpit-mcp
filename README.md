@@ -35,7 +35,7 @@ The project can be packaged and installed from a wheel:
 
 ```sh
 # build the wheel
-python -m build            # -> dist/cockpit_mcp-0.1.1-py3-none-any.whl
+python -m build            # -> dist/cockpit_mcp-0.1.2-py3-none-any.whl
 # or: pip wheel . -w dist/
 
 # install it (pulls in mcp, tree-sitter, tree-sitter-javascript)

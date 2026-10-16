@@ -18,7 +18,9 @@ classifiers = [
     "Programming Language :: Python :: 3.13",
     "Operating System :: POSIX :: Linux",
     "Topic :: System :: Systems Administration",
+    "License :: OSI Approved :: MIT License",
 ]
+license = { text = "MIT" }
 dependencies = [
     "mcp>=1.0",
     "tree-sitter>=0.23",
