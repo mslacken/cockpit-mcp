@@ -30,6 +30,23 @@ from typing import Any, Callable
 
 import cockpit_list_tools as clt
 
+
+def get_version() -> str:
+    """The project version: from the installed package when pip-installed,
+    else from the VERSION file next to the sources (development tree)."""
+    try:
+        from importlib import metadata
+        return metadata.version("cockpit-mcp")
+    except Exception:
+        pass
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "VERSION")
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return fh.read().strip()
+    except OSError:
+        return "unknown"
+
+
 SUPERUSER_TIMEOUT = float(os.environ.get("COCKPIT_BRIDGE_SUPERUSER_TIMEOUT", "60"))
 
 
@@ -1086,6 +1103,8 @@ def main(argv: list[str] | None = None) -> int:
                     "browser: check that the privileged path works, or exercise "
                     "it on a throwaway account.",
         epilog="Environment: COCKPIT_USER, COCKPIT_PASSWORD")
+    parser.add_argument("--version", action="store_true",
+                        help="print the version and exit")
     parser.add_argument("target", nargs="?", default=None,
                         metavar="[SCHEME://]HOST[:PORT]",
                         help=f"the Cockpit server (default: {clt.DEFAULT_TARGET})")
@@ -1102,6 +1121,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--list", action="store_true",
                         help="list the catalog actions that have an adapter")
     args = parser.parse_args(argv)
+
+    if args.version:
+        print("cockpit-mcp %s" % get_version())
+        return 0
 
     if args.list:
         for name, adapter in sorted(ADAPTERS.items()):

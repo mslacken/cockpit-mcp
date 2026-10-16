@@ -71,6 +71,22 @@ DEFAULT_TARGET = "localhost:9090"
 DEFAULT_FETCH_DIR = "/tmp/opencode/live"
 
 
+def get_version() -> str:
+    """The project version: from the installed package when pip-installed,
+    else from the VERSION file next to the sources (development tree)."""
+    try:
+        from importlib import metadata
+        return metadata.version("cockpit-mcp")
+    except Exception:
+        pass
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "VERSION")
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return fh.read().strip()
+    except OSError:
+        return "unknown"
+
+
 # ==========================================================================
 # Record model (Python mirror of the cockpit_js_parser records)
 # ==========================================================================
@@ -825,7 +841,7 @@ def main(argv: list[str] | None = None) -> int:
     args = p.parse_args(argv)
 
     if args.version:
-        print("cockpit_mcp_server_ng.py (1.0) — Cockpit bundle extractor + MCP")
+        print("cockpit-mcp %s" % get_version())
         return 0
     if args.mcp:
         if not MCP_AVAILABLE:

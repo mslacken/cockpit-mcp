@@ -50,6 +50,23 @@ from typing import Any
 import tree_sitter_javascript
 from tree_sitter import Language, Node, Parser, Query, QueryCursor
 
+
+def get_version() -> str:
+    """The project version: from the installed package when pip-installed,
+    else from the VERSION file next to the sources (development tree)."""
+    try:
+        from importlib import metadata
+        return metadata.version("cockpit-mcp")
+    except Exception:
+        pass
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "VERSION")
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return fh.read().strip()
+    except OSError:
+        return "unknown"
+
+
 JS = Language(tree_sitter_javascript.language())
 
 METHODS = {"spawn": "spawn", "spawnp": "spawn", "script": "script",
@@ -743,6 +760,9 @@ def main() -> int:
     if len(sys.argv) < 2:
         print("usage: cockpit_js_parser.py <in.json>", file=sys.stderr)
         return 2
+    if sys.argv[1] == "--version":
+        print("cockpit-mcp %s" % get_version())
+        return 0
     with open(sys.argv[1], encoding="utf-8") as fh:
         payload = json.load(fh)
     bundles = payload if isinstance(payload, list) else payload.get("bundles", [])

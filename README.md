@@ -21,18 +21,12 @@ the detection of available tools is better suited through a coding harness.
 
 ### From a GitHub release
 
-When a [release](https://github.com/mslacken/cockpit-mcp/releases) is published,
-the `release` workflow builds a wheel and attaches it to the release assets:
+Each [release](https://github.com/mslacken/cockpit-mcp/releases) ships a wheel.
+Install it straight from the release asset (pulls in `mcp`, `tree-sitter`,
+`tree-sitter-javascript`):
 
 ```sh
-# grab the download URL of the wheel from the latest release
-URL=$(curl -fsSL https://api.github.com/repos/mslacken/cockpit-mcp/releases/latest \
-      | grep -o '"browser_download_url": *"[^"]*\.whl"' | head -1 \
-      | sed 's/"browser_download_url": *"//;s/"$//')
-
-# install it (pulls in mcp, tree-sitter, tree-sitter-javascript)
-curl -fsSL -o cockpit_mcp.whl "$URL"
-pip install cockpit_mcp.whl
+pip install https://github.com/mslacken/cockpit-mcp/releases/download/v0.1.1/cockpit_mcp-0.1.1-py3-none-any.whl
 ```
 
 ### From source
@@ -41,7 +35,7 @@ The project can be packaged and installed from a wheel:
 
 ```sh
 # build the wheel
-python -m build            # -> dist/cockpit_mcp-1.0.0-py3-none-any.whl
+python -m build            # -> dist/cockpit_mcp-0.1.1-py3-none-any.whl
 # or: pip wheel . -w dist/
 
 # install it (pulls in mcp, tree-sitter, tree-sitter-javascript)

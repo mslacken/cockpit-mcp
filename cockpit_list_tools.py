@@ -226,6 +226,22 @@ from dataclasses import dataclass, field
 from typing import Any, BinaryIO, Iterator
 
 
+def get_version() -> str:
+    """The project version: from the installed package when pip-installed,
+    else from the VERSION file next to the sources (development tree)."""
+    try:
+        from importlib import metadata
+        return metadata.version("cockpit-mcp")
+    except Exception:
+        pass
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "VERSION")
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return fh.read().strip()
+    except OSError:
+        return "unknown"
+
+
 def _envbool(name: str) -> bool:
     return os.environ.get(name, "").strip().lower() in ("1", "true", "yes")
 
@@ -3570,6 +3586,8 @@ def main(argv: list[str] | None = None) -> int:
                     "of actions it offers, with their descriptions and input values.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="Environment: COCKPIT_HOST/PORT/USER/PASSWORD/TLS/TLS_INSECURE/CA/SUPERUSER/TIMEOUT")
+    parser.add_argument("--version", action="store_true",
+                        help="print the version and exit")
     parser.add_argument("target", nargs="?", default=None,
                         metavar="[SCHEME://]HOST[:PORT]",
                         help=f"the Cockpit server to query (default: {DEFAULT_TARGET})")
@@ -3591,6 +3609,10 @@ def main(argv: list[str] | None = None) -> int:
                         help="do not verify the server's TLS certificate")
     parser.add_argument("--json", action="store_true", help="emit JSON instead of a tree")
     args = parser.parse_args(argv)
+
+    if args.version:
+        print("cockpit-mcp %s" % get_version())
+        return 0
 
     if args.tools and not args.controls:
         parser.error("--tools needs the per-page scan: drop --no-controls")
